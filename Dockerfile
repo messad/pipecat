@@ -25,7 +25,9 @@ COPY pyproject.toml uv.lock* ./
 # ÖNEMLİ: Container içinde venv oluşturmak yerine --system flag'i kullanıyoruz.
 # Docker zaten izole bir ortam olduğu için venv aktivasyonu ile uğraşmanıza gerek yok.
 # Bu komut paketleri doğrudan sistem python'una kurar.
-RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" 
+RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
+    python-dotenv \
+    loguru
 
 # Eğer elinizde bir uv.lock dosyası varsa ve sadece onu senkronize etmek isterseniz:
 # RUN uv sync --frozen --system --no-dev
