@@ -28,7 +28,10 @@ COPY pyproject.toml uv.lock* ./
 RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
     python-dotenv \
     loguru \
-    transformers
+    transformers \
+    fastapi \
+    uvicorn \
+    torch
 
 # Eğer elinizde bir uv.lock dosyası varsa ve sadece onu senkronize etmek isterseniz:
 # RUN uv sync --frozen --system --no-dev
