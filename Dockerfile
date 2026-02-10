@@ -32,7 +32,8 @@ RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,a
     fastapi \
     uvicorn \
     torch \
-    pipecat-ai-small-webrtc-prebuilt
+    pipecat-ai-small-webrtc-prebuilt \
+    aiortc
 
 # Eğer elinizde bir uv.lock dosyası varsa ve sadece onu senkronize etmek isterseniz:
 # RUN uv sync --frozen --system --no-dev
