@@ -1,38 +1,41 @@
-FROM python:3.11-slim
+# Base image olarak slim-bookworm kullanıyoruz (daha güncel ve kararlı)
+FROM python:3.11-slim-bookworm
 
-# Sistem paketleri: audio/voice için zorunlu, build için gcc
+# 1. ADIM: uv binary'sini resmi imajdan kopyala (En güvenli yöntem budur)
+# curl ile indirmek yerine bunu kullanmak path hatalarını %100 çözer.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# 2. ADIM: Sistem paketlerini kur
+# Pipecat ses işleme (audio/voice) için bu kütüphanelere muhtaçtır.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ffmpeg libsndfile1 libportaudio2 build-essential \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    libportaudio2 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
-
-# uv'yi manuel kur (installer script + PATH export + versiyon pin ile stabil)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && echo 'export PATH="/root/.cargo/bin:$PATH"' >> /root/.bashrc \
-    && /root/.cargo/bin/uv --version  # test et (log'larda göreceksin)
-
-# PATH'i kalıcı set et (her layer'da çalışsın)
-ENV PATH="/root/.cargo/bin:$PATH"
 
 # Çalışma dizini
 WORKDIR /app
 
-# uv.lock ve pyproject.toml ile cache'le (eğer varsa)
+# 3. ADIM: Bağımlılıkları Kur
+# uv.lock ve pyproject.toml dosyalarını kopyala
 COPY pyproject.toml uv.lock* ./
 
-# venv oluştur + pipecat-ai'yi tüm extras ile kur (system-wide, no venv activate gerekmez)
-RUN uv venv /opt/venv \
-    && . /opt/venv/bin/activate \
-    && uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
-    && uv sync --frozen --no-dev --no-install-project
+# ÖNEMLİ: Container içinde venv oluşturmak yerine --system flag'i kullanıyoruz.
+# Docker zaten izole bir ortam olduğu için venv aktivasyonu ile uğraşmanıza gerek yok.
+# Bu komut paketleri doğrudan sistem python'una kurar.
+RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" 
 
-# Tüm kodu kopyala
+# Eğer elinizde bir uv.lock dosyası varsa ve sadece onu senkronize etmek isterseniz:
+# RUN uv sync --frozen --system --no-dev
+
+# 4. ADIM: Uygulama kodlarını kopyala
 COPY . .
 
-# Env path venv için
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Port (Pipecat runner default 7860)
+# Coolify için Port (Değiştirmediyseniz 7860)
 EXPOSE 7860
 
-# Bot'u çalıştır (bot dosyanı değiştir – örn. bot.py veya examples/voice-bot.py)
+# Ortam değişkenleri Coolify arayüzünden geleceği için burada ENV tanımlamaya gerek yok.
+# Botu başlat
 CMD ["python", "bot.py"]
