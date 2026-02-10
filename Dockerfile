@@ -38,4 +38,4 @@ EXPOSE 7860
 
 # Ortam değişkenleri Coolify arayüzünden geleceği için burada ENV tanımlamaya gerek yok.
 # Botu başlat
-CMD ["python", "bot.py"]
+CMD ["python", "examples/quickstart/bot.py"]
