@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+websockets
+loguru
+pipecat-ai[deepgram,openai,anthropic,cartesia,elevenlabs,silero]
