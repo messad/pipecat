@@ -1,8 +1,7 @@
 # Base image olarak slim-bookworm kullanıyoruz (daha güncel ve kararlı)
 FROM python:3.11-slim-bookworm
 
-# 1. ADIM: uv binary'sini resmi imajdan kopyala (En güvenli yöntem budur)
-# curl ile indirmek yerine bunu kullanmak path hatalarını %100 çözer.
+# 1. ADIM: uv binary'sini resmi imajdan kopyala
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # 2. ADIM: Sistem paketlerini kur
@@ -19,12 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # 3. ADIM: Bağımlılıkları Kur
-# uv.lock ve pyproject.toml dosyalarını kopyala
 COPY pyproject.toml uv.lock* ./
 
-# ÖNEMLİ: Container içinde venv oluşturmak yerine --system flag'i kullanıyoruz.
-# Docker zaten izole bir ortam olduğu için venv aktivasyonu ile uğraşmanıza gerek yok.
-# Bu komut paketleri doğrudan sistem python'una kurar.
+# ÖNEMLİ DEĞİŞİKLİK BURADA:
+# Listeye 'websockets' ve 'greenswitch' eklendi.
+# greenswitch -> FreeSWITCH ESL bağlantısı için şart.
+# websockets -> Pipecat transport için şart.
 RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
     python-dotenv \
     loguru \
@@ -33,17 +32,16 @@ RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,a
     uvicorn \
     torch \
     pipecat-ai-small-webrtc-prebuilt \
-    aiortc
-
-# Eğer elinizde bir uv.lock dosyası varsa ve sadece onu senkronize etmek isterseniz:
-# RUN uv sync --frozen --system --no-dev
+    aiortc \
+    websockets \
+    greenswitch
 
 # 4. ADIM: Uygulama kodlarını kopyala
 COPY . .
 
-# Coolify için Port (Değiştirmediyseniz 7860)
+# Coolify için Port (Senin dosyan 7860 kullanıyordu, onu korudum)
 EXPOSE 7860
 
-# Ortam değişkenleri Coolify arayüzünden geleceği için burada ENV tanımlamaya gerek yok.
-# Botu başlat
-CMD ["python", "examples/quickstart/bot.py"]
+# BAŞLATMA KOMUTU DEĞİŞTİ:
+# Artık bot.py değil, yeni yazdığımız server.py çalışacak.
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
