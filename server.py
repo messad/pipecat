@@ -1,8 +1,10 @@
 import os
 import sys
 import uuid
+import asyncio
+import socket
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, WebSocket, BackgroundTasks, HTTPException
+from fastapi import FastAPI, WebSocket, BackgroundTasks
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
@@ -20,9 +22,6 @@ from pipecat.services.elevenlabs import ElevenLabsTTSService
 from pipecat.transports.network.websocket_server import WebsocketServerTransport, WebsocketServerParams
 from pipecat.frames.frames import LLMMessagesFrame
 
-# ESL (FreeSWITCH Event Socket) - outbound arama için
-import ESL
-
 # Loglama
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -32,12 +31,12 @@ app = FastAPI()
 # Aktif çağrı konfigürasyonları (hafızada)
 active_call_configs: Dict[str, Any] = {}
 
-# Ortam değişkenlerinden FreeSWITCH ESL bağlantı bilgileri
+# FreeSWITCH ESL bağlantı bilgileri
 FS_HOST = os.getenv("FREESWITCH_HOST", "127.0.0.1")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
 
-# Pipecat server'ın dışarıya açık adresi (FreeSWITCH buraya WS bağlayacak)
+# Pipecat server'ın dışarıya açık WS adresi
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:8000")
 
 
@@ -47,20 +46,57 @@ class OutboundCallRequest(BaseModel):
     llm_model: str = "gpt-4o"
     stt_provider: str = "deepgram"
     tts_provider: str = "cartesia"
-    tts_voice_id: Optional[str] = None          # Boşsa provider default'u kullanır
+    tts_voice_id: Optional[str] = None
     system_prompt: str = "Sen yardımsever bir asistansın."
-    caller_id: str = "2167064380"               # NetGSM'deki numaranız
+    caller_id: str = "2167064380"
+
+
+# --- ESL: raw TCP ile FreeSWITCH'e bağlan, originate at ---
+async def esl_originate(originate_cmd: str) -> str:
+    """
+    Python ESL modülü gerektirmeden raw TCP socket ile
+    FreeSWITCH ESL'e bağlanıp bgapi originate komutu gönderir.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _send():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect((FS_HOST, FS_ESL_PORT))
+
+        def recv_until(marker: bytes) -> bytes:
+            buf = b""
+            while marker not in buf:
+                buf += s.recv(4096)
+            return buf
+
+        # 1. Auth banner bekle
+        recv_until(b"auth/request")
+
+        # 2. Şifre gönder
+        s.sendall(f"auth {FS_ESL_PASSWORD}\n\n".encode())
+        resp = recv_until(b"\n\n")
+        if b"+OK accepted" not in resp:
+            raise Exception(f"ESL auth başarısız: {resp}")
+
+        # 3. bgapi originate gönder
+        cmd = f"bgapi originate {originate_cmd}\n\n"
+        s.sendall(cmd.encode())
+        resp = recv_until(b"\n\n")
+        s.close()
+        return resp.decode(errors="replace")
+
+    result = await loop.run_in_executor(None, _send)
+    return result
 
 
 # --- DİNAMİK SERVİS FABRİKASI ---
 def service_factory(config: dict):
-    # 1. STT
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
-        language="tr"  # Türkçe - gerekirse config'den alınabilir
+        language="tr"
     )
 
-    # 2. LLM - system_prompt context olarak iletiliyor
     system_messages = [{"role": "system", "content": config.get("system_prompt", "Sen yardımsever bir asistansın.")}]
 
     if config.get("llm_provider") == "anthropic":
@@ -75,7 +111,6 @@ def service_factory(config: dict):
             model=config.get("llm_model", "gpt-4o")
         )
 
-    # 3. TTS
     if config.get("tts_provider") == "elevenlabs":
         tts = ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
@@ -90,96 +125,70 @@ def service_factory(config: dict):
     return stt, llm, tts, system_messages
 
 
-# --- OUTBOUND ARAMA: n8n bu endpoint'i çağırır ---
+# --- OUTBOUND: n8n bu endpoint'i çağırır ---
 @app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    ws_path = f"/ws/{call_id}"
-    ws_url = f"{PIPECAT_WS_BASE}{ws_path}"
+    ws_url = f"{PIPECAT_WS_BASE}/ws/{call_id}"
 
-    logger.info(f"Outbound arama başlatılıyor. call_id={call_id}, hedef={request.phone_number}")
+    logger.info(f"Outbound arama: call_id={call_id}, hedef={request.phone_number}")
 
-    # FreeSWITCH ESL üzerinden originate komutu gönder
+    originate_cmd = (
+        f"{{"
+        f"origination_caller_id_number={request.caller_id},"
+        f"origination_caller_id_name={request.caller_id},"
+        f"pipecat_call_id={call_id},"
+        f"pipecat_ws_url={ws_url},"
+        f"ignore_early_media=false,"
+        f"progress_timeout=60"
+        f"}}sofia/gateway/netgsm/{request.phone_number} "
+        f"&lua(/usr/share/freeswitch/scripts/pipecat_connect.lua)"
+    )
+
     try:
-        con = ESL.ESLconnection(FS_HOST, str(FS_ESL_PORT), FS_ESL_PASSWORD)
-        if not con.connected():
-            raise Exception("FreeSWITCH ESL bağlantısı kurulamadı")
-
-        # originate komutu:
-        # - call_id ve ws_url'i channel variable olarak geçiyoruz
-        # - Dialplan'da bu variable'ları kullanarak audio_stream başlatacağız
-        originate_cmd = (
-            f"originate {{"
-            f"origination_caller_id_number={request.caller_id},"
-            f"origination_caller_id_name={request.caller_id},"
-            f"pipecat_call_id={call_id},"
-            f"pipecat_ws_url={ws_url},"
-            f"ignore_early_media=false,"
-            f"progress_timeout=60"
-            f"}}sofia/gateway/netgsm/{request.phone_number} "
-            f"&lua(/usr/share/freeswitch/scripts/pipecat_connect.lua)"
-        )
-
-        logger.debug(f"ESL originate: {originate_cmd}")
-        result = con.api("bgapi", originate_cmd)
-        logger.info(f"ESL cevabı: {result.getBody() if result else 'None'}")
-        con.disconnect()
-
+        result = await esl_originate(originate_cmd)
+        logger.info(f"ESL cevabı: {result}")
+        return {"status": "initiated", "call_id": call_id, "websocket_url": ws_url, "esl_response": result}
     except Exception as e:
         logger.error(f"ESL hatası: {e}")
-        # ESL bağlanamasa bile call_id'yi dön, manual test için
         return {
             "status": "esl_error",
             "error": str(e),
             "call_id": call_id,
             "websocket_url": ws_url,
-            "note": "FreeSWITCH'e bağlanılamadı, manual originate gerekebilir"
+            "note": "FreeSWITCH'e bağlanılamadı"
         }
 
-    return {
-        "status": "initiated",
-        "call_id": call_id,
-        "websocket_url": ws_url,
-        "phone_number": request.phone_number
-    }
 
-
-# --- INBOUND / MANUAL TEST endpoint'i ---
-# FreeSWITCH sabit bir path ile bağlanır, system_prompt default gelir
+# --- INBOUND: sabit path ile gelen çağrılar ---
 @app.post("/inbound-call")
-async def register_inbound_call(background_tasks: BackgroundTasks):
+async def register_inbound_call():
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = {
         "llm_provider": "openai",
         "llm_model": "gpt-4o",
-        "stt_provider": "deepgram",
         "tts_provider": "cartesia",
         "system_prompt": "Sen yardımsever bir asistansın.",
     }
     ws_url = f"{PIPECAT_WS_BASE}/ws/{call_id}"
-    logger.info(f"Inbound çağrı kaydedildi. call_id={call_id}")
     return {"call_id": call_id, "websocket_url": ws_url}
 
 
-# --- WEBSOCKET ENDPOINT: FreeSWITCH buraya bağlanır ---
+# --- WEBSOCKET: FreeSWITCH buraya bağlanır ---
 @app.websocket("/ws/{call_id}")
 async def websocket_endpoint(websocket: WebSocket, call_id: str):
     await websocket.accept()
-    logger.info(f"FreeSWITCH WebSocket bağlandı. call_id={call_id}")
+    logger.info(f"FreeSWITCH bağlandı. call_id={call_id}")
 
-    config = active_call_configs.get(call_id)
-    if not config:
-        logger.warning(f"call_id bulunamadı: {call_id}, default config kullanılıyor")
-        config = {
-            "llm_provider": "openai",
-            "llm_model": "gpt-4o",
-            "system_prompt": "Sen yardımsever bir asistansın.",
-            "tts_provider": "cartesia"
-        }
+    config = active_call_configs.get(call_id) or {
+        "llm_provider": "openai",
+        "llm_model": "gpt-4o",
+        "system_prompt": "Sen yardımsever bir asistansın.",
+        "tts_provider": "cartesia"
+    }
 
-    # FreeSWITCH → mod_audio_stream → 8000Hz 16bit mono L16
     transport = WebsocketServerTransport(
         params=WebsocketServerParams(
             audio_in_sample_rate=8000,
@@ -202,16 +211,14 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
 
-    # OpenAI için system_prompt'u initial message olarak gönder
     if config.get("llm_provider") != "anthropic":
         await task.queue_frame(LLMMessagesFrame(system_messages))
 
     await runner.run(task)
 
-    # Temizlik
     if call_id in active_call_configs:
         del active_call_configs[call_id]
-        logger.info(f"Çağrı tamamlandı, config temizlendi. call_id={call_id}")
+        logger.info(f"Çağrı tamamlandı. call_id={call_id}")
 
 
 # --- SAĞLIK KONTROLÜ ---
