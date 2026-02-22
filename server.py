@@ -57,10 +57,15 @@ async def esl_originate(originate_cmd: str) -> str:
         s.settimeout(10)
         s.connect((FS_HOST, FS_ESL_PORT))
 
-        def recv_until(marker: bytes) -> bytes:
+        def recv_until(marker: bytes, max_bytes: int = 65536) -> bytes:
             buf = b""
             while marker not in buf:
-                buf += s.recv(4096)
+                chunk = s.recv(4096)
+                if not chunk:
+                    raise Exception("ESL bağlantısı beklenmedik şekilde kapandı")
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise Exception(f"ESL cevabı max_bytes ({max_bytes}) aştı, sonsuz döngü önlendi")
             return buf
 
         recv_until(b"auth/request")
