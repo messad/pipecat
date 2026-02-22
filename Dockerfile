@@ -41,8 +41,8 @@ COPY . .
 COPY pipecat_connect.lua /usr/share/freeswitch/scripts/pipecat_connect.lua
 
 # Coolify için Port (Senin dosyan 7860 kullanıyordu, onu korudum)
-EXPOSE 7860
+EXPOSE 8000
 
 # BAŞLATMA KOMUTU DEĞİŞTİ:
 # Artık bot.py değil, yeni yazdığımız server.py çalışacak.
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
