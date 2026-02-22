@@ -3,40 +3,38 @@ import sys
 import uuid
 import asyncio
 import socket
+import logging
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, WebSocket, BackgroundTasks
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
+
 # Pipecat importları
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.aggregators.llm_response import LLMUserResponseAggregator
-from pipecat.services.openai import OpenAILLMService
-from pipecat.services.anthropic import AnthropicLLMService
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.elevenlabs import ElevenLabsTTSService
-from pipecat.transports.network.websocket_server import WebsocketServerTransport, WebsocketServerParams
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
 from pipecat.frames.frames import LLMMessagesFrame
 
-# Loglama
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
 app = FastAPI()
 
-# Aktif çağrı konfigürasyonları (hafızada)
 active_call_configs: Dict[str, Any] = {}
 
-# FreeSWITCH ESL bağlantı bilgileri
 FS_HOST = os.getenv("FREESWITCH_HOST", "127.0.0.1")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-
-# Pipecat server'ın dışarıya açık WS adresi
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:8000")
 
 
@@ -51,12 +49,7 @@ class OutboundCallRequest(BaseModel):
     caller_id: str = "2167064380"
 
 
-# --- ESL: raw TCP ile FreeSWITCH'e bağlan, originate at ---
 async def esl_originate(originate_cmd: str) -> str:
-    """
-    Python ESL modülü gerektirmeden raw TCP socket ile
-    FreeSWITCH ESL'e bağlanıp bgapi originate komutu gönderir.
-    """
     loop = asyncio.get_event_loop()
 
     def _send():
@@ -70,16 +63,12 @@ async def esl_originate(originate_cmd: str) -> str:
                 buf += s.recv(4096)
             return buf
 
-        # 1. Auth banner bekle
         recv_until(b"auth/request")
-
-        # 2. Şifre gönder
         s.sendall(f"auth {FS_ESL_PASSWORD}\n\n".encode())
         resp = recv_until(b"\n\n")
         if b"+OK accepted" not in resp:
             raise Exception(f"ESL auth başarısız: {resp}")
 
-        # 3. bgapi originate gönder
         cmd = f"bgapi originate {originate_cmd}\n\n"
         s.sendall(cmd.encode())
         resp = recv_until(b"\n\n")
@@ -90,7 +79,6 @@ async def esl_originate(originate_cmd: str) -> str:
     return result
 
 
-# --- DİNAMİK SERVİS FABRİKASI ---
 def service_factory(config: dict):
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
@@ -125,14 +113,22 @@ def service_factory(config: dict):
     return stt, llm, tts, system_messages
 
 
-# --- OUTBOUND: n8n bu endpoint'i çağırır ---
+@app.get("/")
+async def root():
+    return {"status": "OK"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "active_calls": len(active_call_configs)}
+
+
 @app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
     ws_url = f"{PIPECAT_WS_BASE}/ws/{call_id}"
-
     logger.info(f"Outbound arama: call_id={call_id}, hedef={request.phone_number}")
 
     originate_cmd = (
@@ -162,7 +158,6 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         }
 
 
-# --- INBOUND: sabit path ile gelen çağrılar ---
 @app.post("/inbound-call")
 async def register_inbound_call():
     call_id = str(uuid.uuid4())
@@ -176,7 +171,6 @@ async def register_inbound_call():
     return {"call_id": call_id, "websocket_url": ws_url}
 
 
-# --- WEBSOCKET: FreeSWITCH buraya bağlanır ---
 @app.websocket("/ws/{call_id}")
 async def websocket_endpoint(websocket: WebSocket, call_id: str):
     await websocket.accept()
@@ -219,12 +213,6 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
     if call_id in active_call_configs:
         del active_call_configs[call_id]
         logger.info(f"Çağrı tamamlandı. call_id={call_id}")
-
-
-# --- SAĞLIK KONTROLÜ ---
-@app.get("/health")
-async def health():
-    return {"status": "ok", "active_calls": len(active_call_configs)}
 
 
 if __name__ == "__main__":
