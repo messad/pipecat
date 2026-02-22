@@ -38,6 +38,7 @@ RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,a
 
 # 4. ADIM: Uygulama kodlarını kopyala
 COPY . .
+COPY pipecat_connect.lua /usr/share/freeswitch/scripts/pipecat_connect.lua
 
 # Coolify için Port (Senin dosyan 7860 kullanıyordu, onu korudum)
 EXPOSE 7860
