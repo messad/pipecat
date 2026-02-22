@@ -35,7 +35,7 @@ active_call_configs: Dict[str, Any] = {}
 FS_HOST = os.getenv("FREESWITCH_HOST", "127.0.0.1")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:8000")
+PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:7860")
 
 
 class OutboundCallRequest(BaseModel):
@@ -221,4 +221,4 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
