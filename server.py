@@ -47,7 +47,6 @@ class OutboundCallRequest(BaseModel):
 
 # --- SENİN ESL BAĞLANTI KODUN (DOKUNULMADI) ---
 async def esl_originate(originate_cmd: str) -> str:
-    # Soket yerine asyncio kullanarak daha asenkron ve güvenli hale getirdik
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
     try:
         await reader.readuntil(b"auth/request\n\n")
@@ -102,19 +101,40 @@ async def raw_tcp_input(reader):
         logger.error(f"Input hata: {e}")
         yield EndFrame()
 
-# --- YENİ, STABİL VE ÇÖKMEYEN TCP LİSTENER ---
+# --- CLAUDE'UN DOĞRULADIĞI HANDSHAKE İLE GÜNCELLENEN TCP LİSTENER ---
 async def handle_fs_connection(reader, writer):
     addr = writer.get_extra_info('peername')
     logger.info(f"FreeSWITCH bağlandı: {addr}")
     try:
-        # FreeSWITCH'in header'larını yut
-        await reader.readuntil(b"\n\n")
-        
-        # FreeSWITCH çağrıyı yüzümüze kapatmasın diye 'connect' emri ver
+        # 1. FreeSWITCH'in ilk paketini oku (CHANNEL_DATA event)
+        buf = b""
+        while b"\n\n" not in buf:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise Exception("Bağlantı handshake öncesi kapandı")
+            buf += chunk
+        logger.info("1. FreeSWITCH ilk paketi başarıyla okundu.")
+
+        # 2. connect komutu gönder
         writer.write(b"connect\n\n")
         await writer.drain()
-        logger.info("FreeSWITCH'e 'connect' emri gönderildi. Hat kilitlendi.")
+        logger.info("2. 'connect' komutu gönderildi.")
 
+        # 3. connect cevabını oku
+        buf = b""
+        while b"\n\n" not in buf:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise Exception("connect cevabı gelmedi")
+            buf += chunk
+        logger.info("3. 'connect' cevabı alındı.")
+
+        # 4. myevents ile tüm eventleri al
+        writer.write(b"myevents\n\n")
+        await writer.drain()
+        logger.info("4. 'myevents' emri gönderildi, Handshake TAMAMLANDI!")
+
+        # --- BURADAN SONRA PIPECAT PIPELINE BAŞLATILIR ---
         config = {"llm_provider": "openai", "llm_model": "gpt-4o", "system_prompt": "Sen yardımsever bir asistansın.", "tts_provider": "cartesia"}
         stt, llm, tts, system_messages = service_factory(config)
         output_processor = RawTCPOutput(writer)
@@ -132,14 +152,14 @@ async def handle_fs_connection(reader, writer):
         task = PipelineTask(pipeline)
         await task.queue_frame(LLMMessagesFrame(system_messages))
         await runner.run(task)
+        
     except Exception as e:
-        logger.error(f"Bağlantı koptu ({addr}): {e}")
+        logger.error(f"Bağlantı koptu veya hata ({addr}): {e}")
     finally:
         writer.close()
         await writer.wait_closed()
 
 async def start_raw_tcp_server():
-    # Sadece IPv4 dinler, IPv6 crash hatasını %100 çözer
     server = await asyncio.start_server(handle_fs_connection, '0.0.0.0', 9001)
     logger.info("🚀 Raw TCP Server 9001 portunda aktif ve bekliyor...")
     async with server:
@@ -161,7 +181,6 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    # ÖNEMLİ: Ortam değişkenini (env) by-pass ettik. Sadece IP ve port var.
     originate_cmd = (
         f"{{"
         f"origination_caller_id_number={request.caller_id},"
