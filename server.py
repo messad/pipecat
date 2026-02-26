@@ -35,7 +35,7 @@ active_call_configs: Dict[str, Any] = {}
 FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://pipecatcon:8000")
+PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "pipecatcon:9001")
 
 
 class OutboundCallRequest(BaseModel):
@@ -171,7 +171,7 @@ async def register_inbound_call():
         "tts_provider": "cartesia",
         "system_prompt": "Sen yardımsever bir asistansın.",
     }
-    raw_url =PIPECAT_WS_BASE
+    raw_url = PIPECAT_WS_BASE
     return {"call_id": call_id, "raw_url": raw_url}
 
 
