@@ -132,7 +132,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    ws_url = f"{PIPECAT_WS_BASE}/ws/{call_id}"
+    raw_url = PIPECAT_WS_BASE
     logger.info(f"Outbound arama: call_id={call_id}, hedef={request.phone_number}")
 
     originate_cmd = (
@@ -144,20 +144,20 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMA"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&socket({ws_url} async full)"
+        f"&socket({raw_url} async full)"
     )
 
     try:
         result = await esl_originate(originate_cmd)
         logger.info(f"ESL cevabı: {result}")
-        return {"status": "initiated", "call_id": call_id, "websocket_url": ws_url, "esl_response": result}
+        return {"status": "initiated", "call_id": call_id, "raw_url": raw_url, "esl_response": result}
     except Exception as e:
         logger.error(f"ESL hatası: {e}")
         return {
             "status": "esl_error",
             "error": str(e),
             "call_id": call_id,
-            "websocket_url": ws_url,
+            "raw_url": raw_url,
             "note": "FreeSWITCH'e bağlanılamadı"
         }
 
@@ -171,8 +171,8 @@ async def register_inbound_call():
         "tts_provider": "cartesia",
         "system_prompt": "Sen yardımsever bir asistansın.",
     }
-    ws_url = f"{PIPECAT_WS_BASE}/ws/{call_id}"
-    return {"call_id": call_id, "websocket_url": ws_url}
+    raw_url =PIPECAT_WS_BASE
+    return {"call_id": call_id, "raw_url": raw_url}
 
 
 @app.websocket("/ws/{call_id}")
