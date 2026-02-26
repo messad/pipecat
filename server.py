@@ -18,7 +18,7 @@ from pipecat.services.openai import OpenAILLMService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 # ÖNEMLİ: Raw TCP üzerinden ses işleme için gerekli transport
-from pipecat.transports.network.tcp import TCPTransport, TCPTransportParams
+from pipecat.transports.network.generic_tcp import GenericTCPTransport, GenericTCPTransportParams
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
