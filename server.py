@@ -65,7 +65,8 @@ def service_factory(config: dict):
 
 # --- RAW TCP SERVER (9001 PORTU) ---
 async def start_raw_tcp_server():
-    server = await asyncio.start_server(handle_fs_connection, '0.0.0.0', 9001)
+    # server = await asyncio.start_server(handle_fs_connection, '0.0.0.0', 9001)
+    server = await asyncio.start_server(handle_fs_connection, host=None, port=9001)
     logger.info("🚀 Raw TCP Server 9001 portunda dinliyor...")
     async with server:
         await server.serve_forever()
