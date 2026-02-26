@@ -190,7 +190,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMA"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&socket(pipecatcon:9001 async full)"
+        f"&socket(10.0.1.7:9001 async full)"
     )
 
     try:
