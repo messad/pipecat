@@ -127,7 +127,6 @@ async def root():
 async def health():
     return {"status": "healthy", "active_calls": len(active_call_configs)}
 
-
 @app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
@@ -219,6 +218,39 @@ async def websocket_endpoint(websocket: WebSocket, call_id: str):
         del active_call_configs[call_id]
         logger.info(f"Çağrı tamamlandı. call_id={call_id}")
 
+async def raw_socket_listener():
+    HOST = '0.0.0.0'
+    PORT = 9001  # 8000'i bozmamak için ayrı port
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(5)
+    logger.info(f"Raw TCP socket dinleniyor: {HOST}:{PORT}")
+
+    loop = asyncio.get_running_loop()
+    while True:
+        client, addr = await loop.sock_accept(server)
+        logger.info(f"FreeSWITCH raw bağlantı geldi: {addr}")
+        asyncio.create_task(handle_raw_client(client, addr))
+
+async def handle_raw_client(client, addr):
+    try:
+        # FreeSWITCH socket app'i text tabanlı basit protokol bekliyor
+        data = await asyncio.get_running_loop().sock_recv(client, 4096)
+        logger.info(f"Raw gelen veri ({addr}): {data.decode(errors='ignore')}")
+
+        # Şimdilik basit echo testi (sonra pipeline tetikleme eklenecek)
+        await asyncio.get_running_loop().sock_sendall(client, b"+OK connected to Pipecat\n")
+
+        # Burada pipeline'ı başlatabilirsin (call_id parse et, config çek vs.)
+        # Örnek: await start_pipeline_from_raw(call_id_from_data)
+    except Exception as e:
+        logger.error(f"Raw socket hata ({addr}): {e}")
+    finally:
+        client.close()
+
+# Uygulama başlatıldığında raw listener'ı çalıştır
+asyncio.create_task(raw_socket_listener())
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
