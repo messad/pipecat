@@ -255,19 +255,14 @@ async def raw_tcp_input(reader):
 
 # --- SENİN YAZDIĞIN TCP LİSTENER ---
 async def raw_socket_listener():
-    HOST = '0.0.0.0'
-    PORT = 9001  # 8000'i bozmamak için ayrı port
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    HOST = ''  # Boş bırakmak veya '::' yapmak tüm IPv4 ve IPv6'ları dinler
+    PORT = 9001
+    # AF_INET yerine AF_INET6 yapıyoruz (IPv4 uyumluluğunu da kapsar)
+    server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM) 
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(5)
-    logger.info(f"Raw TCP socket dinleniyor: {HOST}:{PORT}")
-
-    loop = asyncio.get_running_loop()
-    while True:
-        client, addr = await loop.sock_accept(server)
-        logger.info(f"FreeSWITCH raw bağlantı geldi: {addr}")
-        asyncio.create_task(handle_raw_client(client, addr))
+    logger.info(f"Raw TCP socket dinleniyor: {PORT}")
 
 
 # --- GÜNCELLENEN TEK FONKSİYON: Echo yerine Pipeline tetikliyor ---
