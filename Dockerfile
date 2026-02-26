@@ -42,6 +42,7 @@ COPY pipecat_connect.lua /usr/share/freeswitch/scripts/pipecat_connect.lua
 
 # Coolify için Port (Senin dosyan 7860 kullanıyordu, onu korudum)
 EXPOSE 8000
+EXPOSE 9001
 
 # BAŞLATMA KOMUTU DEĞİŞTİ:
 # Artık bot.py değil, yeni yazdığımız server.py çalışacak.
