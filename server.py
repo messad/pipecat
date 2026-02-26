@@ -141,11 +141,11 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name={request.caller_id},"
         f"pipecat_call_id={call_id},"
-        f"pipecat_ws_url={ws_url},"
-        f"ignore_early_media=false,"
-        f"progress_timeout=60"
+        f"ignore_early_media=true,"
+        f"progress_timeout=60,"
+        f"absolute_codec_string=PCMA"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&lua(/usr/share/freeswitch/scripts/pipecat_connect.lua)"
+        f"&socket({ws_url} async full)"
     )
 
     try:
