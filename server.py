@@ -3,254 +3,145 @@ import sys
 import uuid
 import asyncio
 import socket
-import logging
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, WebSocket, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
-
-# Pipecat importları
+# Pipecat pipeline bileşenleri
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.aggregators.llm_response import LLMUserResponseAggregator
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
-from pipecat.frames.frames import LLMMessagesFrame
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.services.openai import OpenAILLMService
+from pipecat.services.deepgram import DeepgramSTTService
+from pipecat.services.cartesia import CartesiaTTSService
+# ÖNEMLİ: Raw TCP üzerinden ses işleme için gerekli transport
+from pipecat.transports.network.tcp import TCPTransport, TCPTransportParams
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
 app = FastAPI()
 
+# Global çağrı konfigürasyonları
 active_call_configs: Dict[str, Any] = {}
 
 FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "pipecatcon:9001")
-
+# FreeSWITCH'in Pipecat'e ulaşacağı adres
+PIPECAT_HOST = "0.0.0.0"
+PIPECAT_TCP_PORT = 9001
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o"
-    stt_provider: str = "deepgram"
-    tts_provider: str = "cartesia"
-    tts_voice_id: Optional[str] = None
-    system_prompt: str = "Sen yardımsever bir asistansın."
+    system_prompt: str = "Sen hızlı bir asistansın."
     caller_id: str = "2167064380"
 
+async def esl_originate(originate_cmd: str):
+    """FreeSWITCH'e outbound çağrı emri gönderir."""
+    reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
+    try:
+        # Auth süreci
+        await reader.readuntil(b"auth/request\n\n")
+        writer.write(f"auth {FS_ESL_PASSWORD}\n\n".encode())
+        await writer.drain()
+        
+        resp = await reader.readuntil(b"\n\n")
+        if b"+OK" not in resp:
+            raise Exception(f"ESL Auth Hatası: {resp}")
 
-async def esl_originate(originate_cmd: str) -> str:
-    loop = asyncio.get_event_loop()
-
-    def _send():
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect((FS_HOST, FS_ESL_PORT))
-
-        def recv_until(marker: bytes, max_bytes: int = 65536) -> bytes:
-            buf = b""
-            while marker not in buf:
-                chunk = s.recv(4096)
-                if not chunk:
-                    raise Exception("ESL bağlantısı beklenmedik şekilde kapandı")
-                buf += chunk
-                if len(buf) > max_bytes:
-                    raise Exception(f"ESL cevabı max_bytes ({max_bytes}) aştı, sonsuz döngü önlendi")
-            return buf
-
-        recv_until(b"auth/request")
-        s.sendall(f"auth {FS_ESL_PASSWORD}\n\n".encode())
-        resp = recv_until(b"\n\n")
-        if b"+OK accepted" not in resp:
-            raise Exception(f"ESL auth başarısız: {resp}")
-
+        # Çağrıyı başlat
         cmd = f"bgapi originate {originate_cmd}\n\n"
-        s.sendall(cmd.encode())
-        resp = recv_until(b"\n\n")
-        s.close()
-        return resp.decode(errors="replace")
+        writer.write(cmd.encode())
+        await writer.drain()
+        return await reader.readuntil(b"\n\n")
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
-    result = await loop.run_in_executor(None, _send)
-    return result
+async def start_pipecat_handler(reader, writer):
+    """FreeSWITCH bağlandığında Pipecat pipeline'ını yönetir."""
+    addr = writer.get_extra_info('peername')
+    logger.info(f"FreeSWITCH'ten raw bağlantı geldi: {addr}")
 
+    try:
+        # 1. FreeSWITCH Outbound Socket Handshake
+        # FreeSWITCH bağlandığında 'connect' mesajı gönderir
+        data = await reader.readuntil(b"\n\n")
+        
+        # Call ID'yi headerlardan yakala (originate komutunda eklemiştik)
+        # Pratik olması için son aktif çağrıyı alıyoruz veya header parse edilebilir
+        call_id = "default" # Gerçek projede data içindeki pipecat_call_id parse edilir
 
-def service_factory(config: dict):
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        language="tr"
-    )
-
-    system_messages = [{"role": "system", "content": config.get("system_prompt", "Sen yardımsever bir asistansın.")}]
-
-    if config.get("llm_provider") == "anthropic":
-        llm = AnthropicLLMService(
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-            model=config.get("llm_model", "claude-3-5-sonnet-20240620"),
-            system=config.get("system_prompt", "Sen yardımsever bir asistansın.")
-        )
-    else:
-        llm = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model=config.get("llm_model", "gpt-4o")
-        )
-
-    if config.get("tts_provider") == "elevenlabs":
-        tts = ElevenLabsTTSService(
-            api_key=os.getenv("ELEVENLABS_API_KEY"),
-            voice_id=config.get("tts_voice_id") or "21m00Tcm4TlvDq8ikWAM"
-        )
-    else:
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id=config.get("tts_voice_id") or "a0e99841-438c-4a64-b679-ae501e7d6091"
+        # 2. Pipecat Transport Kurulumu (Raw TCP)
+        # FreeSWITCH genellikle 8000Hz Mono PCMA/L16 bekler
+        transport = TCPTransport(
+            reader, 
+            writer,
+            params=TCPTransportParams(
+                audio_in_sample_rate=8000,
+                audio_out_sample_rate=8000,
+            )
         )
 
-    return stt, llm, tts, system_messages
+        # 3. Servislerin Hazırlanması
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), language="tr")
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id="eda_id")
 
+        messages = [{"role": "system", "content": "Sen hızlı bir sesli asistansın."}]
+        context = OpenAILLMContext(messages)
+        context_aggregator = llm.create_context_aggregator(context)
 
-@app.get("/")
-async def root():
-    return {"status": "OK"}
+        pipeline = Pipeline([
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ])
 
+        task = PipelineTask(pipeline)
+        runner = PipelineRunner()
+        
+        logger.info("Pipeline başlatılıyor...")
+        await runner.run(task)
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "active_calls": len(active_call_configs)}
+    except Exception as e:
+        logger.error(f"Handler Hatası: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+@app.on_event("startup")
+async def start_tcp_listener():
+    """TCP Port 9001'i dinlemeye başlar."""
+    server = await asyncio.start_server(start_pipecat_handler, PIPECAT_HOST, PIPECAT_TCP_PORT)
+    logger.info(f"🚀 Raw TCP Server dinliyor: {PIPECAT_HOST}:{PIPECAT_TCP_PORT}")
+    asyncio.create_task(server.serve_forever())
 
 @app.post("/outbound-call")
-async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
-    call_id = str(uuid.uuid4())
-    active_call_configs[call_id] = request.dict()
-
-    raw_url = PIPECAT_WS_BASE
-    logger.info(f"Outbound arama: call_id={call_id}, hedef={request.phone_number}")
-
+async def outbound_call(request: OutboundCallRequest):
+    # FreeSWITCH'e giden komutta /ws/ gibi URL yapılarını sildik.
+    # Sadece IP:PORT veriyoruz.
     originate_cmd = (
-        f"{{"
-        f"origination_caller_id_number={request.caller_id},"
-        f"origination_caller_id_name={request.caller_id},"
-        f"pipecat_call_id={call_id},"
-        f"ignore_early_media=true,"
-        f"progress_timeout=60,"
-        f"absolute_codec_string=PCMA"
-        f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&socket({raw_url} async full)"
+        f"{{origination_caller_id_number={request.caller_id},"
+        f"absolute_codec_string=PCMA,"
+        f"ignore_early_media=true}}"
+        f"sofia/gateway/netgsm/{request.phone_number} "
+        f"&socket({os.getenv('PIPECAT_HOST_INTERNAL', 'pipecatcon')}:{PIPECAT_TCP_PORT} async full)"
     )
-
+    
     try:
         result = await esl_originate(originate_cmd)
-        logger.info(f"ESL cevabı: {result}")
-        return {"status": "initiated", "call_id": call_id, "raw_url": raw_url, "esl_response": result}
+        return {"status": "success", "detail": result.decode()}
     except Exception as e:
-        logger.error(f"ESL hatası: {e}")
-        return {
-            "status": "esl_error",
-            "error": str(e),
-            "call_id": call_id,
-            "raw_url": raw_url,
-            "note": "FreeSWITCH'e bağlanılamadı"
-        }
-
-
-@app.post("/inbound-call")
-async def register_inbound_call():
-    call_id = str(uuid.uuid4())
-    active_call_configs[call_id] = {
-        "llm_provider": "openai",
-        "llm_model": "gpt-4o",
-        "tts_provider": "cartesia",
-        "system_prompt": "Sen yardımsever bir asistansın.",
-    }
-    raw_url = PIPECAT_WS_BASE
-    return {"call_id": call_id, "raw_url": raw_url}
-
-
-@app.websocket("/ws/{call_id}")
-async def websocket_endpoint(websocket: WebSocket, call_id: str):
-    await websocket.accept()
-    logger.info(f"FreeSWITCH bağlandı. call_id={call_id}")
-
-    config = active_call_configs.get(call_id) or {
-        "llm_provider": "openai",
-        "llm_model": "gpt-4o",
-        "system_prompt": "Sen yardımsever bir asistansın.",
-        "tts_provider": "cartesia"
-    }
-
-    transport = WebsocketServerTransport(
-        params=WebsocketServerParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            add_wav_header=False
-        )
-    )
-
-    stt, llm, tts, system_messages = service_factory(config)
-
-    pipeline = Pipeline([
-        transport.input(),
-        stt,
-        LLMUserResponseAggregator(),
-        llm,
-        tts,
-        transport.output()
-    ])
-
-    runner = PipelineRunner()
-    task = PipelineTask(pipeline)
-
-    if config.get("llm_provider") != "anthropic":
-        await task.queue_frame(LLMMessagesFrame(system_messages))
-
-    await runner.run(task)
-
-    if call_id in active_call_configs:
-        del active_call_configs[call_id]
-        logger.info(f"Çağrı tamamlandı. call_id={call_id}")
-
-async def raw_socket_listener():
-    HOST = '0.0.0.0'
-    PORT = 9001  # 8000'i bozmamak için ayrı port
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(5)
-    logger.info(f"Raw TCP socket dinleniyor: {HOST}:{PORT}")
-
-    loop = asyncio.get_running_loop()
-    while True:
-        client, addr = await loop.sock_accept(server)
-        logger.info(f"FreeSWITCH raw bağlantı geldi: {addr}")
-        asyncio.create_task(handle_raw_client(client, addr))
-
-async def handle_raw_client(client, addr):
-    try:
-        # FreeSWITCH socket app'i text tabanlı basit protokol bekliyor
-        data = await asyncio.get_running_loop().sock_recv(client, 4096)
-        logger.info(f"Raw gelen veri ({addr}): {data.decode(errors='ignore')}")
-
-        # Şimdilik basit echo testi (sonra pipeline tetikleme eklenecek)
-        await asyncio.get_running_loop().sock_sendall(client, b"+OK connected to Pipecat\n")
-
-        # Burada pipeline'ı başlatabilirsin (call_id parse et, config çek vs.)
-        # Örnek: await start_pipeline_from_raw(call_id_from_data)
-    except Exception as e:
-        logger.error(f"Raw socket hata ({addr}): {e}")
-    finally:
-        client.close()
-
-# Uygulama başlatıldığında raw listener'ı çalıştır
-asyncio.create_task(raw_socket_listener())
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
