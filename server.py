@@ -273,13 +273,17 @@ async def raw_socket_listener():
 # --- GÜNCELLENEN TEK FONKSİYON: Echo yerine Pipeline tetikliyor ---
 async def handle_raw_client(client, addr):
     try:
-        # Senin ham client nesneni, Pipecat streamleri için async formata çeviriyoruz
         reader, writer = await asyncio.open_connection(sock=client)
         
-        # FreeSWITCH'in gönderdiği ilk text header'ı yut (Pipeline'a ses diye gitmesin)
-        await reader.readuntil(b"\n\n")
+        # 1. FreeSWITCH'in gönderdiği detayları oku
+        header = await reader.readuntil(b"\n\n")
+        logger.info("FreeSWITCH bağlandı, header alındı.")
 
-        # Şimdilik varsayılan config çekiliyor (istersen sonradan call_id parse edilebilir)
+        # 2. KRİTİK NOKTA: FreeSWITCH'e "Bağlantıyı kabul ettim, kanalı aç" de
+        writer.write(b"connect\n\n")
+        await writer.drain()
+        logger.info("FreeSWITCH'e 'connect' emri gönderildi, çağrı kilitlendi.")
+
         config = {
             "llm_provider": "openai",
             "llm_model": "gpt-4o",
@@ -287,8 +291,6 @@ async def handle_raw_client(client, addr):
             "tts_provider": "cartesia"
         }
         stt, llm, tts, system_messages = service_factory(config)
-
-        # Pipecat 0.0.103 için hazırladığımız özel girdi/çıktı modülleri
         output_processor = RawTCPOutput(writer)
 
         pipeline = Pipeline([
