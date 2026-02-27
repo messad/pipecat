@@ -24,6 +24,7 @@ from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.elevenlabs import ElevenLabsTTSService
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -76,53 +77,49 @@ def service_factory(config: dict):
     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
     return stt, llm, tts, system_messages
 
-# --- ADIM 3: PİPECAT RAW TCP İÇİN ÖZEL GİRDİ/ÇIKTI ---
-class RawTCPOutput(FrameProcessor):
-    def __init__(self, writer):
+# --- PİPECAT WEBSOCKET İÇİN ÖZEL GİRDİ/ÇIKTI ---
+class WebSocketOutput(FrameProcessor):
+    def __init__(self, websocket: WebSocket):
         super().__init__()
-        self.writer = writer
+        self.websocket = websocket
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, AudioRawFrame):
             try:
-                # TTS'ten gelen sesi FreeSWITCH'e gönder
-                self.writer.write(frame.audio)
-                await self.writer.drain()
+                # TTS'ten gelen L16 8000Hz sesi WebSocket üzerinden FreeSWITCH'e gönder
+                await self.websocket.send_bytes(frame.audio)
             except Exception as e:
-                logger.error(f"Ses gönderme hatası: {e}")
+                logger.error(f"WebSocket ses gönderme hatası: {e}")
         elif isinstance(frame, EndFrame):
-            self.writer.close()
+            pass # Bağlantıyı FastAPI route yönetecek
 
-async def raw_tcp_input(reader):
+async def websocket_input(websocket: WebSocket):
     try:
         while True:
-            # KRİTİK: read() yerine readexactly(320) kullanıyoruz.
-            # L16 formatında 8000Hz, 20ms ses tam olarak 320 byte'tır.
-            # Bu, eksik veya yarım ses paketlerini engelleyecek.
-            data = await reader.readexactly(320)
+            # FreeSWITCH'ten gelen ses paketlerini (bytes) oku
+            data = await websocket.receive_bytes()
             yield AudioRawFrame(audio=data, sample_rate=8000, num_channels=1)
-    except asyncio.IncompleteReadError:
-        # Bağlantı sonlandığında (örneğin telefon kapandığında) güvenli çıkış
+    except WebSocketDisconnect:
+        logger.info("FreeSWITCH WebSocket bağlantısı koptu.")
         yield EndFrame()
     except Exception as e:
-        logger.error(f"Ses okuma hatası: {e}")
+        logger.error(f"WebSocket okuma hatası: {e}")
         yield EndFrame()
 
-# --- ADIM 2: GÜNCELLENEN TCP LİSTENER (mod_audio_stream için) ---
-async def handle_fs_connection(reader, writer):
-    addr = writer.get_extra_info('peername')
-    logger.info(f"FreeSWITCH mod_audio_stream bağlandı: {addr}")
+# --- ADIM 2: YENİ WEBSOCKET LİSTENER ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("FreeSWITCH WebSocket üzerinden bağlandı.")
+    
     try:
-        # 1. FreeSWITCH mod_audio_stream'in gönderdiği JSON metadata'yı oku
-        header_bytes = await reader.readuntil(b'\n\n')
-        header_str = header_bytes.decode('utf-8').strip()
-        
-        # JSON'u parse edip loga basalım (rate: 8000, channels: 1 gibi değerleri göreceğiz)
-        meta = json.loads(header_str)
+        # FreeSWITCH ilk bağlantıda metadata'yı metin (text) olarak gönderir
+        metadata_str = await websocket.receive_text()
+        meta = json.loads(metadata_str)
         logger.info(f"Metadata alındı, ses akışı başlıyor: {meta}")
 
-        # 2. Pipeline Başlatılıyor (Eski ESL komutlarına gerek kalmadı!)
+        # Pipeline Başlatılıyor
         config = {
             "llm_provider": "openai", 
             "llm_model": "gpt-4o", 
@@ -130,10 +127,10 @@ async def handle_fs_connection(reader, writer):
             "tts_provider": "cartesia"
         }
         stt, llm, tts, system_messages = service_factory(config)
-        output_processor = RawTCPOutput(writer)
+        output_processor = WebSocketOutput(websocket)
 
         pipeline = Pipeline([
-            raw_tcp_input(reader), # JSON'dan hemen sonra gelen ham ses buraya akacak
+            websocket_input(websocket),
             stt,
             LLMUserResponseAggregator(),
             llm,
@@ -144,27 +141,26 @@ async def handle_fs_connection(reader, writer):
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
         
-        # Asistanı tetiklemek için ilk mesajı yolla
         await task.queue_frame(LLMMessagesFrame(system_messages))
-        
         logger.info("Pipeline çalışıyor...")
         await runner.run(task)
         
+    except WebSocketDisconnect:
+        logger.info("WebSocket bağlantısı (aramadan dolayı) sonlandı.")
     except Exception as e:
-        logger.error(f"Bağlantı koptu veya hata ({addr}): {e}")
+        logger.error(f"WebSocket işleme hatası: {e}")
     finally:
-        writer.close()
-        await writer.wait_closed()
+        # Bağlantı kapanmışsa bile kapatmayı dener, hata verirse yoksayar
+        try:
+            await websocket.close()
+        except:
+            pass
 
 async def start_raw_tcp_server():
     server = await asyncio.start_server(handle_fs_connection, '0.0.0.0', 9001)
     logger.info("🚀 Raw TCP Server 9001 portunda aktif ve bekliyor...")
     async with server:
         await server.serve_forever()
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(start_raw_tcp_server())
 
 # --- API ENDPOINTS ---
 @app.get("/")
@@ -174,13 +170,11 @@ async def root(): return {"status": "OK"}
 async def health(): return {"status": "healthy"}
 
 @app.post("/outbound-call")
-@app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    # YENİ EKLENEN KISIM: mod_audio_stream için originate komutu
-    # NOT: pipecatcon isminde DNS sorunu yaşarsan buraya sabit IP (örn: 10.0.1.7:9001) yazabilirsin
+    # YENİ EKLENEN KISIM: api_on_answer ve ws:// yönlendirmesi
     originate_cmd = (
         f"{{"
         f"origination_uuid={call_id},"
@@ -190,7 +184,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMU,"
-        f"api_on_answer='uuid_audio_stream {call_id} start 10.0.1.7:9001 mono 8000'" 
+        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'" 
         f"}}sofia/gateway/netgsm/{request.phone_number} "
         f"&park()" 
     )
