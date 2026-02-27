@@ -183,14 +183,16 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     # NOT: pipecatcon isminde DNS sorunu yaşarsan buraya sabit IP (örn: 10.0.1.7:9001) yazabilirsin
     originate_cmd = (
         f"{{"
+        f"origination_uuid={call_id},"
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
-        f"absolute_codec_string=PCMU"
+        f"absolute_codec_string=PCMU,"
+        f"api_on_answer='uuid_audio_stream {call_id} start 10.0.1.7:9001 mono 8000'" 
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&audio_stream(10.0.1.7:9001 pipecatcon:9001)" 
+        f"&park()" 
     )
 
     try:
