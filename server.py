@@ -201,10 +201,13 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"pipecat_call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
-        f"absolute_codec_string=L16,"  # ← PCMU yerine L16 yapıyoruz (mod_audio_stream L16 bekler)
+        f"absolute_codec_string=L16,"
+        f"origination_caller_id_number=+2167064380,"  # Caller ID'yi + ile dene
+        f"origination_dialplan=XML,"  # Explicit dialplan ekle
+        f"origination_context=public,"  # Public context (gateway outbound için standart)
         f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&echo()"  # ← park yerine echo
+        f"&echo()"
     )
 
     try:
