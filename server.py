@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import logging
 from typing import Dict, Any, Optional
+
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
@@ -12,16 +13,17 @@ import uvicorn
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 
-# Pipecat Uyumlu Importlar
+# Pipecat Importlar (universal LLM context için güncel yol)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.openai import OpenAILLMService, OpenAILLMContext
-from pipecat.processors.aggregators.llm_response import LLMContextAggregator
+from pipecat.services.openai.llm import OpenAILLMService  # sub-module (deprecation fix)
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame
+from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -44,7 +46,7 @@ class OutboundCallRequest(BaseModel):
     system_prompt: str = "Sen yardımsever bir asistansın."
     caller_id: str = "2167064380"
 
-# --- ESL BAĞLANTI KODUN ---
+# ESL bağlantı (değişmedi)
 async def esl_originate(originate_cmd: str) -> str:
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
     try:
@@ -66,21 +68,22 @@ async def esl_originate(originate_cmd: str) -> str:
         writer.close()
         await writer.wait_closed()
 
-# --- SERVİS FABRİKAN (Deprecation Fix Uygulandı) ---
+# Servis factory (universal LLMContext + Pair)
 def service_factory(config: dict):
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), language="tr")
     
-    # Yeni Context ve Aggregator Yapısı
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
-    context = OpenAILLMContext([{"role": "system", "content": system_prompt}])
-    context_aggregator = LLMContextAggregator(context)
+    context = LLMContext(
+        messages=[{"role": "system", "content": system_prompt}]
+    )
+    context_aggregator_pair = LLMContextAggregatorPair(context)
     
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
     
-    return stt, llm, tts, context_aggregator
+    return stt, llm, tts, context_aggregator_pair
 
-# --- PİPECAT WEBSOCKET ÇIKTI İŞLEMCİSİ ---
+# WebSocket Output (değişmedi)
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -94,7 +97,7 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
-# --- PİPECAT WEBSOCKET GİRDİ ÜRETECİ ---
+# WebSocket Input generator (disconnect'te EndFrame yield)
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
@@ -104,33 +107,40 @@ async def websocket_input(websocket: WebSocket):
             elif 'bytes' in message and message['bytes']:
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
+                logger.info("WebSocket disconnect yakalandı.")
                 break
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
 
-# --- WEBSOCKET ENDPOINT ---
+# WebSocket Endpoint (push yöntemi + universal aggregator)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
     
     try:
-        config = { ... }  # aynı
+        config = {
+            "llm_provider": "openai", 
+            "llm_model": "gpt-4o", 
+            "system_prompt": "Sen yardımsever bir asistansın.", 
+            "tts_provider": "cartesia"
+        }
         
-        stt, llm, tts, context_aggregator = service_factory(config)
+        stt, llm, tts, context_aggregator_pair = service_factory(config)
         output_processor = WebSocketOutput(websocket)
 
         pipeline = Pipeline([
             stt,
-            context_aggregator,
+            context_aggregator_pair.user(),  # User input aggregator
             llm,
             tts,
-            output_processor
+            output_processor,
+            context_aggregator_pair.assistant()  # Assistant output aggregator (context günceller)
         ])
 
         runner = PipelineRunner()
-        task = PipelineTask(pipeline)  # istersen PipelineParams ekle: PipelineParams(allow_interruptions=True)
+        task = PipelineTask(pipeline)
 
         async def push_audio():
             try:
@@ -143,7 +153,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Ses push hatası: {e}")
                 await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
             finally:
-                await task.queue_frame(EndFrame())  # garanti
+                await task.queue_frame(EndFrame())  # Garanti kapanış
 
         logger.info("Pipeline ve Ses Girişi başlatılıyor...")
         
@@ -157,7 +167,7 @@ async def websocket_endpoint(websocket: WebSocket):
         except:
             pass
 
-# --- API ENDPOINTS ---
+# API Endpoints (değişmedi)
 @app.get("/")
 async def root(): return {"status": "OK"}
 
