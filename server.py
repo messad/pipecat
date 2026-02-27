@@ -5,26 +5,23 @@ import uuid
 import asyncio
 import logging
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, BackgroundTasks, WebSocket
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 
-# Pipecat 0.0.103 Uyumlu Importlar
+# Pipecat Uyumlu Importlar
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.aggregators.llm_response import LLMUserResponseAggregator
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.openai import OpenAILLMService
-from pipecat.services.anthropic import AnthropicLLMService
+from pipecat.services.openai import OpenAILLMService, OpenAILLMContext
+from pipecat.processors.aggregators.llm_response import LLMContextAggregator
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.elevenlabs import ElevenLabsTTSService
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -47,7 +44,7 @@ class OutboundCallRequest(BaseModel):
     system_prompt: str = "Sen yardımsever bir asistansın."
     caller_id: str = "2167064380"
 
-# --- SENİN ESL BAĞLANTI KODUN (DOKUNULMADI) ---
+# --- ESL BAĞLANTI KODUN ---
 async def esl_originate(originate_cmd: str) -> str:
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
     try:
@@ -69,15 +66,21 @@ async def esl_originate(originate_cmd: str) -> str:
         writer.close()
         await writer.wait_closed()
 
-# --- SENİN SERVİS FABRİKAN (DOKUNULMADI) ---
+# --- SERVİS FABRİKAN (Deprecation Fix Uygulandı) ---
 def service_factory(config: dict):
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), language="tr")
-    system_messages = [{"role": "system", "content": config.get("system_prompt", "Sen yardımsever bir asistansın.")}]
+    
+    # Yeni Context ve Aggregator Yapısı
+    system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
+    context = OpenAILLMContext([{"role": "system", "content": system_prompt}])
+    context_aggregator = LLMContextAggregator(context)
+    
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
-    return stt, llm, tts, system_messages
+    
+    return stt, llm, tts, context_aggregator
 
-# --- PİPECAT WEBSOCKET İÇİN ÖZEL GİRDİ/ÇIKTI ---
+# --- PİPECAT WEBSOCKET ÇIKTI İŞLEMCİSİ ---
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -87,71 +90,65 @@ class WebSocketOutput(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, AudioRawFrame):
             try:
-                # TTS'ten gelen L16 8000Hz sesi WebSocket üzerinden FreeSWITCH'e gönder
                 await self.websocket.send_bytes(frame.audio)
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
-        elif isinstance(frame, EndFrame):
-            pass # Bağlantıyı FastAPI route yönetecek
 
+# --- PİPECAT WEBSOCKET GİRDİ ÜRETECİ ---
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
-            # Gelen paketin tipini dinamik olarak kontrol et (Text mi, Bytes mı?)
             message = await websocket.receive()
-            
             if 'text' in message and message['text']:
-                metadata = message['text']
-                logger.info(f"FreeSWITCH'ten Metadata/Text geldi: {metadata}")
-            
+                logger.info(f"FreeSWITCH Metadata: {message['text']}")
             elif 'bytes' in message and message['bytes']:
-                audio_data = message['bytes']
-                # Gelen raw L16 sesi Pipecat'e gönder
-                yield AudioRawFrame(audio=audio_data, sample_rate=8000, num_channels=1)
-                
+                yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
-                logger.info("FreeSWITCH WebSocket bağlantısı koptu.")
-                yield EndFrame()
                 break
-                
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
-        yield EndFrame()
+    yield EndFrame()
 
-# --- ADIM 2: YENİ WEBSOCKET LİSTENER ---
+# --- WEBSOCKET ENDPOINT ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
     
     try:
-        config = {
-            "llm_provider": "openai", 
-            "llm_model": "gpt-4o", 
-            "system_prompt": "Sen yardımsever bir asistansın.", 
-            "tts_provider": "cartesia"
-        }
-        stt, llm, tts, system_messages = service_factory(config)
+        config = { ... }  # aynı
+        
+        stt, llm, tts, context_aggregator = service_factory(config)
         output_processor = WebSocketOutput(websocket)
 
         pipeline = Pipeline([
-            websocket_input(websocket), # Yeni güvenli okuyucu burada
             stt,
-            LLMUserResponseAggregator(),
+            context_aggregator,
             llm,
             tts,
             output_processor
         ])
 
         runner = PipelineRunner()
-        task = PipelineTask(pipeline)
+        task = PipelineTask(pipeline)  # istersen PipelineParams ekle: PipelineParams(allow_interruptions=True)
+
+        async def push_audio():
+            try:
+                async for frame in websocket_input(websocket):
+                    await task.queue_frame(frame)
+            except WebSocketDisconnect:
+                logger.info("WebSocket kapandı (istemci tarafı).")
+                await task.queue_frame(EndFrame())
+            except Exception as e:
+                logger.error(f"Ses push hatası: {e}")
+                await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
+            finally:
+                await task.queue_frame(EndFrame())  # garanti
+
+        logger.info("Pipeline ve Ses Girişi başlatılıyor...")
         
-        await task.queue_frame(LLMMessagesFrame(system_messages))
-        logger.info("Pipeline çalışıyor...")
-        await runner.run(task)
+        await asyncio.gather(runner.run(task), push_audio())
         
-    except WebSocketDisconnect:
-        logger.info("WebSocket bağlantısı (aramadan dolayı) sonlandı.")
     except Exception as e:
         logger.error(f"WebSocket işleme hatası: {e}")
     finally:
@@ -159,12 +156,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except:
             pass
-
-async def start_raw_tcp_server():
-    server = await asyncio.start_server(handle_fs_connection, '0.0.0.0', 9001)
-    logger.info("🚀 Raw TCP Server 9001 portunda aktif ve bekliyor...")
-    async with server:
-        await server.serve_forever()
 
 # --- API ENDPOINTS ---
 @app.get("/")
@@ -178,7 +169,6 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    # YENİ EKLENEN KISIM: api_on_answer ve ws:// yönlendirmesi
     originate_cmd = (
         f"{{"
         f"origination_uuid={call_id},"
