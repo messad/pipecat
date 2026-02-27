@@ -97,12 +97,23 @@ class WebSocketOutput(FrameProcessor):
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
-            # FreeSWITCH'ten gelen ses paketlerini (bytes) oku
-            data = await websocket.receive_bytes()
-            yield AudioRawFrame(audio=data, sample_rate=8000, num_channels=1)
-    except WebSocketDisconnect:
-        logger.info("FreeSWITCH WebSocket bağlantısı koptu.")
-        yield EndFrame()
+            # Gelen paketin tipini dinamik olarak kontrol et (Text mi, Bytes mı?)
+            message = await websocket.receive()
+            
+            if 'text' in message and message['text']:
+                metadata = message['text']
+                logger.info(f"FreeSWITCH'ten Metadata/Text geldi: {metadata}")
+            
+            elif 'bytes' in message and message['bytes']:
+                audio_data = message['bytes']
+                # Gelen raw L16 sesi Pipecat'e gönder
+                yield AudioRawFrame(audio=audio_data, sample_rate=8000, num_channels=1)
+                
+            elif message.get('type') == 'websocket.disconnect':
+                logger.info("FreeSWITCH WebSocket bağlantısı koptu.")
+                yield EndFrame()
+                break
+                
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
         yield EndFrame()
@@ -111,15 +122,9 @@ async def websocket_input(websocket: WebSocket):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("FreeSWITCH WebSocket üzerinden bağlandı.")
+    logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
     
     try:
-        # FreeSWITCH ilk bağlantıda metadata'yı metin (text) olarak gönderir
-        metadata_str = await websocket.receive_text()
-        meta = json.loads(metadata_str)
-        logger.info(f"Metadata alındı, ses akışı başlıyor: {meta}")
-
-        # Pipeline Başlatılıyor
         config = {
             "llm_provider": "openai", 
             "llm_model": "gpt-4o", 
@@ -130,7 +135,7 @@ async def websocket_endpoint(websocket: WebSocket):
         output_processor = WebSocketOutput(websocket)
 
         pipeline = Pipeline([
-            websocket_input(websocket),
+            websocket_input(websocket), # Yeni güvenli okuyucu burada
             stt,
             LLMUserResponseAggregator(),
             llm,
@@ -150,7 +155,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket işleme hatası: {e}")
     finally:
-        # Bağlantı kapanmışsa bile kapatmayı dener, hata verirse yoksayar
         try:
             await websocket.close()
         except:
