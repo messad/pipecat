@@ -141,7 +141,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
-
+        await task.queue_frame(LLMMessagesFrame([{"role": "system", "content": config["system_prompt"]}]))
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
