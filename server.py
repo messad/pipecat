@@ -105,6 +105,7 @@ async def websocket_input(websocket: WebSocket):
             if 'text' in message and message['text']:
                 logger.info(f"FreeSWITCH Metadata: {message['text']}")
             elif 'bytes' in message and message['bytes']:
+                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
                 logger.info("WebSocket disconnect yakalandı.")
