@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import uuid
@@ -75,7 +76,7 @@ def service_factory(config: dict):
     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
     return stt, llm, tts, system_messages
 
-# --- PIPECAT RAW TCP İÇİN ÖZEL GİRDİ/ÇIKTI ---
+# --- ADIM 3: PİPECAT RAW TCP İÇİN ÖZEL GİRDİ/ÇIKTI ---
 class RawTCPOutput(FrameProcessor):
     def __init__(self, writer):
         super().__init__()
@@ -84,63 +85,55 @@ class RawTCPOutput(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, AudioRawFrame):
-            self.writer.write(frame.audio)
-            await self.writer.drain()
+            try:
+                # TTS'ten gelen sesi FreeSWITCH'e gönder
+                self.writer.write(frame.audio)
+                await self.writer.drain()
+            except Exception as e:
+                logger.error(f"Ses gönderme hatası: {e}")
         elif isinstance(frame, EndFrame):
             self.writer.close()
 
 async def raw_tcp_input(reader):
     try:
         while True:
-            data = await reader.read(320)
-            if not data:
-                yield EndFrame()
-                break
+            # KRİTİK: read() yerine readexactly(320) kullanıyoruz.
+            # L16 formatında 8000Hz, 20ms ses tam olarak 320 byte'tır.
+            # Bu, eksik veya yarım ses paketlerini engelleyecek.
+            data = await reader.readexactly(320)
             yield AudioRawFrame(audio=data, sample_rate=8000, num_channels=1)
+    except asyncio.IncompleteReadError:
+        # Bağlantı sonlandığında (örneğin telefon kapandığında) güvenli çıkış
+        yield EndFrame()
     except Exception as e:
-        logger.error(f"Input hata: {e}")
+        logger.error(f"Ses okuma hatası: {e}")
         yield EndFrame()
 
-# --- CLAUDE'UN DOĞRULADIĞI HANDSHAKE İLE GÜNCELLENEN TCP LİSTENER ---
+# --- ADIM 2: GÜNCELLENEN TCP LİSTENER (mod_audio_stream için) ---
 async def handle_fs_connection(reader, writer):
     addr = writer.get_extra_info('peername')
-    logger.info(f"FreeSWITCH bağlandı: {addr}")
+    logger.info(f"FreeSWITCH mod_audio_stream bağlandı: {addr}")
     try:
-        # 1. FreeSWITCH'in ilk paketini oku (CHANNEL_DATA event)
-        buf = b""
-        while b"\n\n" not in buf:
-            chunk = await reader.read(4096)
-            if not chunk:
-                raise Exception("Bağlantı handshake öncesi kapandı")
-            buf += chunk
-        logger.info("1. FreeSWITCH ilk paketi başarıyla okundu.")
+        # 1. FreeSWITCH mod_audio_stream'in gönderdiği JSON metadata'yı oku
+        header_bytes = await reader.readuntil(b'\n\n')
+        header_str = header_bytes.decode('utf-8').strip()
+        
+        # JSON'u parse edip loga basalım (rate: 8000, channels: 1 gibi değerleri göreceğiz)
+        meta = json.loads(header_str)
+        logger.info(f"Metadata alındı, ses akışı başlıyor: {meta}")
 
-        # 2. connect komutu gönder
-        writer.write(b"connect\n\n")
-        await writer.drain()
-        logger.info("2. 'connect' komutu gönderildi.")
-
-        # 3. connect cevabını oku
-        buf = b""
-        while b"\n\n" not in buf:
-            chunk = await reader.read(4096)
-            if not chunk:
-                raise Exception("connect cevabı gelmedi")
-            buf += chunk
-        logger.info("3. 'connect' cevabı alındı.")
-
-        # 4. myevents ile tüm eventleri al
-        writer.write(b"myevents\n\n")
-        await writer.drain()
-        logger.info("4. 'myevents' emri gönderildi, Handshake TAMAMLANDI!")
-
-        # --- BURADAN SONRA PIPECAT PIPELINE BAŞLATILIR ---
-        config = {"llm_provider": "openai", "llm_model": "gpt-4o", "system_prompt": "Sen yardımsever bir asistansın.", "tts_provider": "cartesia"}
+        # 2. Pipeline Başlatılıyor (Eski ESL komutlarına gerek kalmadı!)
+        config = {
+            "llm_provider": "openai", 
+            "llm_model": "gpt-4o", 
+            "system_prompt": "Sen yardımsever bir asistansın.", 
+            "tts_provider": "cartesia"
+        }
         stt, llm, tts, system_messages = service_factory(config)
         output_processor = RawTCPOutput(writer)
 
         pipeline = Pipeline([
-            raw_tcp_input(reader),
+            raw_tcp_input(reader), # JSON'dan hemen sonra gelen ham ses buraya akacak
             stt,
             LLMUserResponseAggregator(),
             llm,
@@ -150,7 +143,11 @@ async def handle_fs_connection(reader, writer):
 
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
+        
+        # Asistanı tetiklemek için ilk mesajı yolla
         await task.queue_frame(LLMMessagesFrame(system_messages))
+        
+        logger.info("Pipeline çalışıyor...")
         await runner.run(task)
         
     except Exception as e:
@@ -177,20 +174,23 @@ async def root(): return {"status": "OK"}
 async def health(): return {"status": "healthy"}
 
 @app.post("/outbound-call")
+@app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
+    # YENİ EKLENEN KISIM: mod_audio_stream için originate komutu
+    # NOT: pipecatcon isminde DNS sorunu yaşarsan buraya sabit IP (örn: 10.0.1.7:9001) yazabilirsin
     originate_cmd = (
         f"{{"
         f"origination_caller_id_number={request.caller_id},"
-        f"origination_caller_id_name={request.caller_id},"
+        f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
-        f"absolute_codec_string=PCMA"
+        f"absolute_codec_string=PCMU"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&socket(10.0.1.7:9001 async full)"
+        f"&audio_stream(10.0.1.7:9001 pipecatcon:9001)" 
     )
 
     try:
