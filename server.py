@@ -20,7 +20,10 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.openai.llm import OpenAILLMService  # sub-module (deprecation fix)
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,  # YENİ EK: Bu hatayı çözer
+)
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
@@ -28,7 +31,7 @@ from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, Err
 # YENİ VAD IMPORTLARI
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from deepgram import LiveOptions  # Deepgram live_options için (eğer yoksa pip install deepgram-sdk)
+from deepgram import LiveOptions  # Deepgram live_options için
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
