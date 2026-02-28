@@ -180,19 +180,6 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
-    # originate_cmd = (
-    #     f"{{"
-    #     f"origination_uuid={call_id},"
-    #     f"origination_caller_id_number={request.caller_id},"
-    #     f"origination_caller_id_name=AI_Asistan,"
-    #     f"pipecat_call_id={call_id},"
-    #     f"ignore_early_media=true,"
-    #     f"progress_timeout=60,"
-    #     f"absolute_codec_string=PCMU,"
-    #     f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'" 
-    #     f"}}sofia/gateway/netgsm/{request.phone_number} "
-    #     f"&park()" 
-    # )
     originate_cmd = (
         f"{{"
         f"origination_uuid={call_id},"
@@ -201,13 +188,10 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"pipecat_call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
-        f"absolute_codec_string=L16,"
-        f"origination_caller_id_number=+2167064380,"  # Caller ID'yi + ile dene
-        f"origination_dialplan=XML,"  # Explicit dialplan ekle
-        f"origination_context=public,"  # Public context (gateway outbound için standart)
-        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'"
+        f"absolute_codec_string=PCMU,"
+        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'" 
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&echo()"
+        f"&park()" 
     )
 
     try:
