@@ -36,6 +36,12 @@ RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,a
     websockets \
     greenswitch
 
+# YENİ EK: Silero VAD ONNX modelini build-time'da indir (cache'e koy)
+# Bu, runtime'da torch.hub.load() hatasını önler
+RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
+    curl -L -o /root/.cache/torch/hub/checkpoints/silero_vad.onnx \
+    https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+
 # 4. ADIM: Uygulama kodlarını kopyala
 COPY . .
 COPY pipecat_connect.lua /usr/share/freeswitch/scripts/pipecat_connect.lua
