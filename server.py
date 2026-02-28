@@ -25,6 +25,11 @@ from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
 
+# YENİ VAD IMPORTLARI
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from deepgram import LiveOptions  # Deepgram live_options için (eğer yoksa pip install deepgram-sdk)
+
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
@@ -68,15 +73,42 @@ async def esl_originate(originate_cmd: str) -> str:
         writer.close()
         await writer.wait_closed()
 
-# Servis factory (universal LLMContext + Pair)
+# Servis factory (VAD EKLEME BURADA)
 def service_factory(config: dict):
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), language="tr")
+    # Deepgram STT - VAD'ı kapat, Silero'ya bırak
+    stt = DeepgramSTTService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        language="tr",
+        live_options=LiveOptions(
+            interim_results=True,
+            vad_events=False,
+            utterance_end_ms=800,
+            endpointing=300,
+            sample_rate=8000,
+            channels=1,
+            encoding="linear16"
+        )
+    )
     
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}]
     )
-    context_aggregator_pair = LLMContextAggregatorPair(context)
+    
+    # VAD ANALYZER EKLE
+    vad_analyzer = SileroVADAnalyzer(
+        params=VADParams(
+            stop_secs=0.3,   # Sessizlik sonrası utterance bitir (düşük = daha hızlı cevap)
+            start_secs=0.15  # Konuşma başlangıcı hassasiyeti
+        )
+    )
+    
+    context_aggregator_pair = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=vad_analyzer,
+        ),
+    )
     
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
@@ -97,7 +129,7 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
-# WebSocket Input generator (disconnect'te EndFrame yield)
+# WebSocket Input generator (değişmedi)
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
@@ -114,7 +146,7 @@ async def websocket_input(websocket: WebSocket):
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
 
-# WebSocket Endpoint (push yöntemi + universal aggregator)
+# WebSocket Endpoint (push_audio debug'li hali kaldı)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -137,24 +169,13 @@ async def websocket_endpoint(websocket: WebSocket):
             llm,
             tts,
             output_processor,
-            context_aggregator_pair.assistant()  # Assistant output aggregator (context günceller)
+            context_aggregator_pair.assistant()  # Assistant output aggregator
         ])
 
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
         await task.queue_frame(LLMMessagesFrame([{"role": "system", "content": config["system_prompt"]}]))
-        # async def push_audio():
-        #     try:
-        #         async for frame in websocket_input(websocket):
-        #             await task.queue_frame(frame)
-        #     except WebSocketDisconnect:
-        #         logger.info("WebSocket kapandı (istemci tarafı).")
-        #         await task.queue_frame(EndFrame())
-        #     except Exception as e:
-        #         logger.error(f"Ses push hatası: {e}")
-        #         await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
-        #     finally:
-        #         await task.queue_frame(EndFrame())  # Garanti kapanış
+        
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
