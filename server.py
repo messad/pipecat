@@ -143,9 +143,27 @@ async def websocket_endpoint(websocket: WebSocket):
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
         await task.queue_frame(LLMMessagesFrame([{"role": "system", "content": config["system_prompt"]}]))
+        # async def push_audio():
+        #     try:
+        #         async for frame in websocket_input(websocket):
+        #             await task.queue_frame(frame)
+        #     except WebSocketDisconnect:
+        #         logger.info("WebSocket kapandı (istemci tarafı).")
+        #         await task.queue_frame(EndFrame())
+        #     except Exception as e:
+        #         logger.error(f"Ses push hatası: {e}")
+        #         await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
+        #     finally:
+        #         await task.queue_frame(EndFrame())  # Garanti kapanış
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
+                    if isinstance(frame, AudioRawFrame):
+                        logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes, "
+                                    f"sample_rate: {frame.sample_rate}, channels: {frame.num_channels}")
+                    else:
+                        logger.debug(f"Non-audio frame: {type(frame).__name__}")
+                    
                     await task.queue_frame(frame)
             except WebSocketDisconnect:
                 logger.info("WebSocket kapandı (istemci tarafı).")
