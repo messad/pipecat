@@ -13,25 +13,23 @@ import uvicorn
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 
-# Pipecat Importlar (universal LLM context için güncel yol)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.openai.llm import OpenAILLMService  # sub-module (deprecation fix)
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,  # YENİ EK: Bu hatayı çözer
+    LLMUserAggregatorParams,
 )
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
-
-# YENİ VAD IMPORTLARI
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from deepgram import LiveOptions  # Deepgram live_options için
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -43,101 +41,120 @@ active_call_configs: Dict[str, Any] = {}
 FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
+PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:8000")
+
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o"
-    stt_provider: str = "deepgram"
-    tts_provider: str = "cartesia"
-    tts_voice_id: Optional[str] = None
-    system_prompt: str = "Sen yardımsever bir asistansın."
     caller_id: str = "2167064380"
+    system_prompt: Optional[str] = "Sen yardımsever bir asistansın."
 
-# ESL bağlantı (değişmedi)
+    # STT
+    stt_provider: Optional[str] = "deepgram"
+    stt_model: Optional[str] = "nova-3"          # nova-3 destekli model adı
+    stt_language: Optional[str] = "tr"
+    stt_sample_rate: Optional[int] = 8000
+
+    # LLM
+    llm_provider: Optional[str] = "openai"
+    llm_model: Optional[str] = "gpt-4o"
+
+    # TTS
+    tts_provider: Optional[str] = "cartesia"
+    tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
+
+
 async def esl_originate(originate_cmd: str) -> str:
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
     try:
         await reader.readuntil(b"auth/request\n\n")
         writer.write(f"auth {FS_ESL_PASSWORD}\n\n".encode())
         await writer.drain()
-        
         resp = await reader.readuntil(b"\n\n")
         if b"+OK accepted" not in resp:
             raise Exception(f"ESL auth başarısız: {resp}")
-
         cmd = f"bgapi originate {originate_cmd}\n\n"
         writer.write(cmd.encode())
         await writer.drain()
-        
         response = await reader.readuntil(b"\n\n")
         return response.decode(errors="replace")
     finally:
         writer.close()
         await writer.wait_closed()
 
-# Servis factory (VAD EKLEME BURADA)
+
 def service_factory(config: dict):
-    # STT provider'a göre seç
     stt_provider = config.get("stt_provider", "deepgram")
+    stt_model = config.get("stt_model", "nova-3")
+    stt_language = config.get("stt_language", "tr")
+    stt_sample_rate = config.get("stt_sample_rate", 8000)
+
     if stt_provider == "deepgram":
+        # nova-3 ile çalışan minimal ve güvenli parametreler
+        # utterance_end_ms ve endpointing nova-3 ile 400 hatasına yol açabiliyor
+        # bu yüzden sadece zorunlu parametreleri gönderiyoruz
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            language="tr",
-            live_options=LiveOptions(
-                model="nova-2",
-                interim_results=True,
-                vad_events=False,
-                utterance_end_ms=800,
-                endpointing=300,
-                sample_rate=8000,
-                channels=1,
-                encoding="linear16",
-                punctuate=True,
-                smart_format=True,
-                profanity_filter=False
-            )
+            live_options={
+                "model": stt_model,
+                "language": stt_language,
+                "encoding": "linear16",
+                "sample_rate": stt_sample_rate,
+                "channels": 1,
+                "interim_results": True,
+                "punctuate": True,
+                "smart_format": False,   # smart_format kapalı - nova-3 ile 400 riski var
+                "vad_events": False,
+                "profanity_filter": False,
+            }
         )
     else:
         raise ValueError(f"Desteklenmeyen STT provider: {stt_provider}")
 
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
-    context = LLMContext(
-        messages=[{"role": "system", "content": system_prompt}]
-    )
-    
-    # VAD ANALYZER EKLE
+    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+
     vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(
-            stop_secs=0.3,   # Sessizlik sonrası utterance bitir (düşük = daha hızlı cevap)
-            start_secs=0.15  # Konuşma başlangıcı hassasiyeti
-        )
+        params=VADParams(stop_secs=0.3, start_secs=0.15)
     )
-    
+
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad_analyzer,
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer),
     )
-    
-    # LLM provider'a göre seç
+
     llm_provider = config.get("llm_provider", "openai")
     if llm_provider == "openai":
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            model=config.get("llm_model", "gpt-4o")
+        )
+    elif llm_provider == "anthropic":
+        llm = AnthropicLLMService(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            model=config.get("llm_model", "claude-3-5-sonnet-20240620"),
+            system=system_prompt
+        )
     else:
         raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
-    
-    # TTS provider'a göre seç
+
     tts_provider = config.get("tts_provider", "cartesia")
     if tts_provider == "cartesia":
-        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
+        )
+    elif tts_provider == "elevenlabs":
+        tts = ElevenLabsTTSService(
+            api_key=os.getenv("ELEVENLABS_API_KEY"),
+            voice_id=config.get("tts_voice_id") or "21m00Tcm4TlvDq8ikWAM"
+        )
     else:
         raise ValueError(f"Desteklenmeyen TTS provider: {tts_provider}")
-    
+
     return stt, llm, tts, context_aggregator_pair
 
-# WebSocket Output (değişmedi)
+
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -151,118 +168,101 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
-# WebSocket Input generator (değişmedi)
+
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive()
-            if 'text' in message and message['text']:
-                logger.info(f"FreeSWITCH Metadata: {message['text']}")
-            elif 'bytes' in message and message['bytes']:
-                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
-                yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
-            elif message.get('type') == 'websocket.disconnect':
-                logger.info("WebSocket disconnect yakalandı.")
+            if "bytes" in message and message["bytes"]:
+                logger.debug(f"Binary ses paketi: {len(message['bytes'])} bytes")
+                yield AudioRawFrame(audio=message["bytes"], sample_rate=8000, num_channels=1)
+            elif "text" in message and message["text"]:
+                logger.info(f"FreeSWITCH metadata: {message['text']}")
+            elif message.get("type") == "websocket.disconnect":
                 break
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
 
-# WebSocket Endpoint (metadata opsiyonel, query param ile call_id al)
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
-    
+    logger.info("WebSocket bağlantısı kuruldu.")
+
     try:
-        # Önce query param'dan call_id'yi dene (en sağlıklı yol)
+        # call_id'yi query param'dan al
         call_id = websocket.query_params.get("call_id")
         if call_id and call_id in active_call_configs:
             config = active_call_configs[call_id]
-            logger.info(f"Query param'dan call_id alındı: {call_id}")
+            logger.info(f"Config bulundu. call_id={call_id}")
         else:
-            # Eğer query yok, ilk mesajı bekle ve text olup olmadığını kontrol et (eski yöntem, patlamasın diye)
-            message = await asyncio.wait_for(websocket.receive(), timeout=2.0)  # Timeout ekle, sonsuz beklemesin
-            if 'text' in message and message['text']:
-                try:
-                    metadata = json.loads(message['text'])
-                    call_id = metadata.get("pipecat_call_id")
-                    if call_id and call_id in active_call_configs:
-                        config = active_call_configs[call_id]
-                        logger.info(f"Metadata'dan call_id alındı: {call_id}")
-                    else:
-                        raise ValueError("Metadata'da call_id bulunamadı veya geçersiz.")
-                except json.JSONDecodeError:
-                    raise ValueError("Metadata JSON parse edilemedi.")
+            # Fallback: son aktif config
+            logger.warning("call_id bulunamadı, son config kullanılıyor.")
+            if active_call_configs:
+                call_id = list(active_call_configs.keys())[-1]
+                config = active_call_configs[call_id]
             else:
-                # Eğer text değil (binary veya başka), default veya son config kullan
-                logger.warning("Metadata gelmedi, son çağrı config'i kullanılıyor.")
-                if active_call_configs:
-                    call_id = list(active_call_configs.keys())[-1]  # Son çağrı
-                    config = active_call_configs[call_id]
-                else:
-                    raise ValueError("Hiç config yok, default kullanılamıyor.")
-        
+                raise ValueError("Aktif config yok.")
+
         stt, llm, tts, context_aggregator_pair = service_factory(config)
         output_processor = WebSocketOutput(websocket)
 
         pipeline = Pipeline([
             stt,
-            context_aggregator_pair.user(),  # User input aggregator
+            context_aggregator_pair.user(),
             llm,
             tts,
             output_processor,
-            context_aggregator_pair.assistant()  # Assistant output aggregator
+            context_aggregator_pair.assistant()
         ])
 
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
-        await task.queue_frame(LLMMessagesFrame([{"role": "system", "content": config["system_prompt"]}]))
-        
+
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
-                    if isinstance(frame, AudioRawFrame):
-                        logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes, "
-                                    f"sample_rate: {frame.sample_rate}, channels: {frame.num_channels}")
-                    else:
-                        logger.debug(f"Non-audio frame: {type(frame).__name__}")
-                    
                     await task.queue_frame(frame)
             except WebSocketDisconnect:
-                logger.info("WebSocket kapandı (istemci tarafı).")
-                await task.queue_frame(EndFrame())
+                logger.info("WebSocket kapandı.")
             except Exception as e:
                 logger.error(f"Ses push hatası: {e}")
                 await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
             finally:
-                await task.queue_frame(EndFrame())  # Garanti kapanış
+                await task.queue_frame(EndFrame())
 
-        logger.info("Pipeline ve Ses Girişi başlatılıyor...")
-        
+        logger.info("Pipeline başlatılıyor...")
         await asyncio.gather(runner.run(task), push_audio())
-        
-    except asyncio.TimeoutError:
-        logger.error("Metadata bekleme timeout: İlk mesaj gelmedi.")
+
     except Exception as e:
         logger.error(f"WebSocket işleme hatası: {e}")
     finally:
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
+        if call_id and call_id in active_call_configs:
+            del active_call_configs[call_id]
+            logger.info(f"Config temizlendi. call_id={call_id}")
 
-# API Endpoints (değişmedi)
+
 @app.get("/")
-async def root(): return {"status": "OK"}
+async def root():
+    return {"status": "OK"}
+
 
 @app.get("/health")
-async def health(): return {"status": "healthy"}
+async def health():
+    return {"status": "healthy", "active_calls": len(active_call_configs)}
+
 
 @app.post("/outbound-call")
 async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
+
+    ws_url = f"{PIPECAT_WS_BASE}/ws?call_id={call_id}"
 
     originate_cmd = (
         f"{{"
@@ -273,9 +273,9 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMU,"
-        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws?call_id={call_id} mono 8000'" 
+        f"api_on_answer='uuid_audio_stream {call_id} start {ws_url} mono 8000'"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&park()" 
+        f"&park()"
     )
 
     try:
@@ -285,6 +285,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     except Exception as e:
         logger.error(f"ESL hatası: {e}")
         return {"status": "esl_error", "error": str(e), "call_id": call_id}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
