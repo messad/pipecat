@@ -38,10 +38,10 @@ app = FastAPI()
 
 active_call_configs: Dict[str, Any] = {}
 
-FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
+FS_HOST = os.getenv("FREESWITCH_HOST", "10.0.1.7")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://localhost:8000")
+PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://10.0.1.7:8000")
 
 
 class OutboundCallRequest(BaseModel):
