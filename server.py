@@ -78,21 +78,29 @@ async def esl_originate(originate_cmd: str) -> str:
 
 # Servis factory (VAD EKLEME BURADA)
 def service_factory(config: dict):
-    # Deepgram STT - VAD'ı kapat, Silero'ya bırak
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        language="tr",
-        live_options=LiveOptions(
-            interim_results=True,
-            vad_events=False,
-            utterance_end_ms=800,
-            endpointing=300,
-            sample_rate=8000,
-            channels=1,
-            encoding="linear16"
+    # STT provider'a göre seç
+    stt_provider = config.get("stt_provider", "deepgram")
+    if stt_provider == "deepgram":
+        stt = DeepgramSTTService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            language="tr",
+            live_options=LiveOptions(
+                model="nova-2",
+                interim_results=True,
+                vad_events=False,
+                utterance_end_ms=800,
+                endpointing=300,
+                sample_rate=8000,
+                channels=1,
+                encoding="linear16",
+                punctuate=True,
+                smart_format=True,
+                profanity_filter=False
+            )
         )
-    )
-    
+    else:
+        raise ValueError(f"Desteklenmeyen STT provider: {stt_provider}")
+
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}]
@@ -113,8 +121,19 @@ def service_factory(config: dict):
         ),
     )
     
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
-    tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
+    # LLM provider'a göre seç
+    llm_provider = config.get("llm_provider", "openai")
+    if llm_provider == "openai":
+        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model=config.get("llm_model", "gpt-4o"))
+    else:
+        raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
+    
+    # TTS provider'a göre seç
+    tts_provider = config.get("tts_provider", "cartesia")
+    if tts_provider == "cartesia":
+        tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"), voice_id=config.get("tts_voice_id") or "eda_id")
+    else:
+        raise ValueError(f"Desteklenmeyen TTS provider: {tts_provider}")
     
     return stt, llm, tts, context_aggregator_pair
 
@@ -139,8 +158,6 @@ async def websocket_input(websocket: WebSocket):
             message = await websocket.receive()
             if 'text' in message and message['text']:
                 logger.info(f"FreeSWITCH Metadata: {message['text']}")
-            elif 'bytes' in message and message['bytes']:
-                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
                 logger.info("WebSocket disconnect yakalandı.")
@@ -156,12 +173,19 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
     
     try:
-        config = {
-            "llm_provider": "openai", 
-            "llm_model": "gpt-4o", 
-            "system_prompt": "Sen yardımsever bir asistansın.", 
-            "tts_provider": "cartesia"
-        }
+        # Metadata bekle, call_id'yi çek
+        message = await websocket.receive()
+        if 'text' in message and message['text']:
+            metadata = json.loads(message['text'])
+            call_id = metadata.get("pipecat_call_id")
+            if call_id:
+                config = active_call_configs.get(call_id)
+                if not config:
+                    raise ValueError(f"Call ID {call_id} için config bulunamadı.")
+            else:
+                raise ValueError("Metadata'da call_id bulunamadı.")
+        else:
+            raise ValueError("Beklenen metadata gelmedi.")
         
         stt, llm, tts, context_aggregator_pair = service_factory(config)
         output_processor = WebSocketOutput(websocket)
