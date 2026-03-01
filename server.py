@@ -158,6 +158,8 @@ async def websocket_input(websocket: WebSocket):
             message = await websocket.receive()
             if 'text' in message and message['text']:
                 logger.info(f"FreeSWITCH Metadata: {message['text']}")
+            elif 'bytes' in message and message['bytes']:
+                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
                 logger.info("WebSocket disconnect yakalandı.")
@@ -166,26 +168,40 @@ async def websocket_input(websocket: WebSocket):
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
 
-# WebSocket Endpoint (push_audio debug'li hali kaldı)
+# WebSocket Endpoint (metadata opsiyonel, query param ile call_id al)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("FreeSWITCH WebSocket üzerinden bağlandı. Ses akışı başlıyor...")
     
     try:
-        # Metadata bekle, call_id'yi çek
-        message = await websocket.receive()
-        if 'text' in message and message['text']:
-            metadata = json.loads(message['text'])
-            call_id = metadata.get("pipecat_call_id")
-            if call_id:
-                config = active_call_configs.get(call_id)
-                if not config:
-                    raise ValueError(f"Call ID {call_id} için config bulunamadı.")
-            else:
-                raise ValueError("Metadata'da call_id bulunamadı.")
+        # Önce query param'dan call_id'yi dene (en sağlıklı yol)
+        call_id = websocket.query_params.get("call_id")
+        if call_id and call_id in active_call_configs:
+            config = active_call_configs[call_id]
+            logger.info(f"Query param'dan call_id alındı: {call_id}")
         else:
-            raise ValueError("Beklenen metadata gelmedi.")
+            # Eğer query yok, ilk mesajı bekle ve text olup olmadığını kontrol et (eski yöntem, patlamasın diye)
+            message = await asyncio.wait_for(websocket.receive(), timeout=2.0)  # Timeout ekle, sonsuz beklemesin
+            if 'text' in message and message['text']:
+                try:
+                    metadata = json.loads(message['text'])
+                    call_id = metadata.get("pipecat_call_id")
+                    if call_id and call_id in active_call_configs:
+                        config = active_call_configs[call_id]
+                        logger.info(f"Metadata'dan call_id alındı: {call_id}")
+                    else:
+                        raise ValueError("Metadata'da call_id bulunamadı veya geçersiz.")
+                except json.JSONDecodeError:
+                    raise ValueError("Metadata JSON parse edilemedi.")
+            else:
+                # Eğer text değil (binary veya başka), default veya son config kullan
+                logger.warning("Metadata gelmedi, son çağrı config'i kullanılıyor.")
+                if active_call_configs:
+                    call_id = list(active_call_configs.keys())[-1]  # Son çağrı
+                    config = active_call_configs[call_id]
+                else:
+                    raise ValueError("Hiç config yok, default kullanılamıyor.")
         
         stt, llm, tts, context_aggregator_pair = service_factory(config)
         output_processor = WebSocketOutput(websocket)
@@ -226,6 +242,8 @@ async def websocket_endpoint(websocket: WebSocket):
         
         await asyncio.gather(runner.run(task), push_audio())
         
+    except asyncio.TimeoutError:
+        logger.error("Metadata bekleme timeout: İlk mesaj gelmedi.")
     except Exception as e:
         logger.error(f"WebSocket işleme hatası: {e}")
     finally:
@@ -255,7 +273,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMU,"
-        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws mono 8000'" 
+        f"api_on_answer='uuid_audio_stream {call_id} start ws://10.0.1.7:8000/ws?call_id={call_id} mono 8000'" 
         f"}}sofia/gateway/netgsm/{request.phone_number} "
         f"&park()" 
     )
