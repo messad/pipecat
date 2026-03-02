@@ -256,7 +256,6 @@ async def websocket_endpoint(websocket: WebSocket):
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
 
-
 @app.get("/")
 async def root():
     return {"status": "OK"}
@@ -283,10 +282,11 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMU"
+        f"api_on_answer='uuid_audio_stream {call_id} start {ws_url} mono 8000'"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&lua(/usr/share/freeswitch/scripts/start_stream.lua {call_id} {ws_url})"
+        f"&park()"
     )
-
+           
     try:
         result = await esl_originate(originate_cmd)
         logger.info(f"ESL cevabı: {result}")
@@ -294,7 +294,6 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     except Exception as e:
         logger.error(f"ESL hatası: {e}")
         return {"status": "esl_error", "error": str(e), "call_id": call_id}
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
