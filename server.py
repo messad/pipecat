@@ -168,22 +168,22 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
-
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive()
-            if "bytes" in message and message["bytes"]:
-                logger.debug(f"Binary ses paketi: {len(message['bytes'])} bytes")
-                yield AudioRawFrame(audio=message["bytes"], sample_rate=8000, num_channels=1)
-            elif "text" in message and message["text"]:
-                logger.info(f"FreeSWITCH metadata: {message['text']}")
-            elif message.get("type") == "websocket.disconnect":
+            if 'text' in message and message['text']:
+                logger.info(f"FreeSWITCH Metadata: {message['text']}")
+                continue  # Text'i ignore et, yield etme
+            elif 'bytes' in message and message['bytes']:
+                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
+                yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
+            elif message.get('type') == 'websocket.disconnect':
+                logger.info("WebSocket disconnect yakalandı.")
                 break
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -220,17 +220,35 @@ async def websocket_endpoint(websocket: WebSocket):
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
 
+        # async def push_audio():
+        #     try:
+        #         async for frame in websocket_input(websocket):
+        #             await task.queue_frame(frame)
+        #     except WebSocketDisconnect:
+        #         logger.info("WebSocket kapandı.")
+        #     except Exception as e:
+        #         logger.error(f"Ses push hatası: {e}")
+        #         await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
+        #     finally:
+        #         await task.queue_frame(EndFrame())
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
+                    if isinstance(frame, AudioRawFrame):
+                        logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes, "
+                                    f"sample_rate: {frame.sample_rate}, channels: {frame.num_channels}")
+                    else:
+                        logger.debug(f"Non-audio frame: {type(frame).__name__}")
+                    
                     await task.queue_frame(frame)
             except WebSocketDisconnect:
-                logger.info("WebSocket kapandı.")
+                logger.info("WebSocket kapandı (istemci tarafı).")
+                await task.queue_frame(EndFrame())
             except Exception as e:
                 logger.error(f"Ses push hatası: {e}")
                 await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
             finally:
-                await task.queue_frame(EndFrame())
+                await task.queue_frame(EndFrame())  # Garanti kapanış
 
         logger.info("Pipeline başlatılıyor...")
         await asyncio.gather(runner.run(task), push_audio())
