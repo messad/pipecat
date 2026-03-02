@@ -11,8 +11,6 @@ from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
-
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
@@ -30,6 +28,9 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from deepgram import LiveOptions
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -51,7 +52,7 @@ class OutboundCallRequest(BaseModel):
 
     # STT
     stt_provider: Optional[str] = "deepgram"
-    stt_model: Optional[str] = "nova-3"          # nova-3 destekli model adı
+    stt_model: Optional[str] = "nova-3"
     stt_language: Optional[str] = "tr"
     stt_sample_rate: Optional[int] = 8000
 
@@ -90,23 +91,20 @@ def service_factory(config: dict):
     stt_sample_rate = config.get("stt_sample_rate", 8000)
 
     if stt_provider == "deepgram":
-        # nova-3 ile çalışan minimal ve güvenli parametreler
-        # utterance_end_ms ve endpointing nova-3 ile 400 hatasına yol açabiliyor
-        # bu yüzden sadece zorunlu parametreleri gönderiyoruz
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options={
-                "model": stt_model,
-                "language": stt_language,
-                "encoding": "linear16",
-                "sample_rate": stt_sample_rate,
-                "channels": 1,
-                "interim_results": True,
-                "punctuate": True,
-                "smart_format": False,   # smart_format kapalı - nova-3 ile 400 riski var
-                "vad_events": False,
-                "profanity_filter": False,
-            }
+            live_options=LiveOptions(
+                model=stt_model,
+                language=stt_language,
+                encoding="linear16",
+                sample_rate=stt_sample_rate,
+                channels=1,
+                interim_results=True,
+                punctuate=True,
+                smart_format=False,
+                vad_events=False,
+                profanity_filter=False
+            )
         )
     else:
         raise ValueError(f"Desteklenmeyen STT provider: {stt_provider}")
@@ -168,22 +166,27 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
+
 async def websocket_input(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive()
             if 'text' in message and message['text']:
                 logger.info(f"FreeSWITCH Metadata: {message['text']}")
-                continue  # Text'i ignore et, yield etme
+                continue
             elif 'bytes' in message and message['bytes']:
                 logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
                 logger.info("WebSocket disconnect yakalandı.")
                 break
+            else:
+                logger.warning(f"Bilinmeyen mesaj tipi: {message}")
+                continue
     except Exception as e:
         logger.error(f"WebSocket okuma hatası: {e}")
     yield EndFrame()
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -191,13 +194,11 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("WebSocket bağlantısı kuruldu.")
 
     try:
-        # call_id'yi query param'dan al
         call_id = websocket.query_params.get("call_id")
         if call_id and call_id in active_call_configs:
             config = active_call_configs[call_id]
             logger.info(f"Config bulundu. call_id={call_id}")
         else:
-            # Fallback: son aktif config
             logger.warning("call_id bulunamadı, son config kullanılıyor.")
             if active_call_configs:
                 call_id = list(active_call_configs.keys())[-1]
@@ -220,17 +221,6 @@ async def websocket_endpoint(websocket: WebSocket):
         runner = PipelineRunner()
         task = PipelineTask(pipeline)
 
-        # async def push_audio():
-        #     try:
-        #         async for frame in websocket_input(websocket):
-        #             await task.queue_frame(frame)
-        #     except WebSocketDisconnect:
-        #         logger.info("WebSocket kapandı.")
-        #     except Exception as e:
-        #         logger.error(f"Ses push hatası: {e}")
-        #         await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
-        #     finally:
-        #         await task.queue_frame(EndFrame())
         async def push_audio():
             try:
                 async for frame in websocket_input(websocket):
@@ -248,7 +238,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Ses push hatası: {e}")
                 await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
             finally:
-                await task.queue_frame(EndFrame())  # Garanti kapanış
+                await task.queue_frame(EndFrame())
 
         logger.info("Pipeline başlatılıyor...")
         await asyncio.gather(runner.run(task), push_audio())
