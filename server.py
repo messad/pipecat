@@ -194,12 +194,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
     call_id = websocket.query_params.get("call_id")
     if not call_id or call_id not in active_call_configs:
-        logger.error(f"Geçersiz veya eksik call_id: {call_id}")
-        await websocket.close(code=1008, reason="Geçersiz call_id")
+        logger.error(f"Geçersiz veya eksik call_id: {call_id}. Bağlantı reddediliyor.")
+        await websocket.close(code=1008, reason="Geçersiz veya eksik call_id")
         return
 
     config = active_call_configs[call_id]
-    logger.info(f"Config bulundu. call_id={call_id}")
+    logger.info(f"Config başarıyla bulundu. call_id={call_id}")
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
     output_processor = WebSocketOutput(websocket)
@@ -220,30 +220,34 @@ async def websocket_endpoint(websocket: WebSocket):
         try:
             async for frame in websocket_input(websocket):
                 if isinstance(frame, AudioRawFrame):
-                    logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes")
+                    logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes, "
+                                f"sample_rate: {frame.sample_rate}, channels: {frame.num_channels}")
                 else:
                     logger.debug(f"Non-audio frame: {type(frame).__name__}")
                 
                 await task.queue_frame(frame)
         except WebSocketDisconnect:
-            logger.info("WebSocket istemci tarafından kapatıldı.")
+            logger.info("WebSocket istemci tarafından kapatıldı (normal çıkış).")
             await task.queue_frame(EndFrame())
         except Exception as e:
             logger.error(f"Ses push hatası: {e}")
             await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
-        # finally'i kaldırdık – runner doğal olarak bitsin, zorla iptal etme
+        # finally yok – runner doğal olarak bitsin, zorla iptal etme
 
     logger.info("Pipeline başlatılıyor...")
     try:
         await asyncio.gather(runner.run(task), push_audio())
     except Exception as e:
-        logger.error(f"Pipeline hatası: {e}")
+        logger.error(f"Pipeline genel hatası: {e}")
     finally:
-        # Sadece temizlik yap
+        # Sadece temizlik: config sil ve websocket kapat
         if call_id in active_call_configs:
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 @app.get("/")
 async def root():
