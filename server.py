@@ -191,7 +191,9 @@ async def websocket_input(websocket: WebSocket):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket bağlantısı kuruldu.")
-
+    logger.info(f"📡 WS Bağlantısı - Query Params: {dict(websocket.query_params)}")
+    logger.info(f"📡 WS Bağlantısı - Headers: {dict(websocket.headers)}")
+    logger.info(f"📡 WS Bağlantısı - call_id alındı: {websocket.query_params.get('call_id')}")
     call_id = websocket.query_params.get("call_id")
     if not call_id or call_id not in active_call_configs:
         logger.error(f"Geçersiz veya eksik call_id: {call_id}. Bağlantı reddediliyor.")
