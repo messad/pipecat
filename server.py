@@ -281,10 +281,10 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"pipecat_call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
-        f"absolute_codec_string=PCMU"
-        f"api_on_answer='uuid_audio_stream {call_id} start {ws_url} mono 8000'"
+        f"absolute_codec_string=PCMU,"   
+        f"ws_url={ws_url}"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&park()"
+        f"&lua(pipecat_connect.lua {call_id})"
     )
            
     try:
