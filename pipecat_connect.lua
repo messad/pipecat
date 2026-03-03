@@ -1,5 +1,4 @@
--- pipecat_connect.lua
--- Güncel versiyon - zombie_exec + park
+-- pipecat_connect.lua  (FINAL - alive loop + en stabil versiyon)
 
 local uuid     = session:getVariable("uuid")
 local call_id  = session:getVariable("pipecat_call_id") or uuid
@@ -11,32 +10,31 @@ if not ws_url or ws_url == "" then
     return
 end
 
-freeswitch.consoleLog("INFO", string.format("[Pipecat] Başlatılıyor → call_id=%s uuid=%s ws=%s\n", call_id, uuid, ws_url))
+freeswitch.consoleLog("INFO", string.format("[Pipecat] BAŞLADI → call_id=%s uuid=%s ws=%s\n", call_id, uuid, ws_url))
 
--- Çağrıyı cevapla (güvenlik için)
 if not session:answered() then
     session:answer()
+    freeswitch.consoleLog("INFO", "[Pipecat] Call answered\n")
 end
 
--- ZOMBIE EXEC FLAG → en önemli satır!
-session:execute("set_zombie_exec")
-freeswitch.consoleLog("INFO", "[Pipecat] Zombie exec flag aktif edildi\n")
+session:sleep(800)
 
-session:sleep(1000)
-
--- Stream başlat (mod_audio_stream önerilen format)
+-- Stream başlat (mono 8000 - Pipecat için en uyumlu)
 local stream_cmd = string.format("uuid_audio_stream %s start %s mono 8000", uuid, ws_url)
 local api = freeswitch.API()
 local result = api:executeString(stream_cmd)
 
-freeswitch.consoleLog("INFO", "[Pipecat] Stream result: " .. tostring(result) .. "\n")
+freeswitch.consoleLog("INFO", "[Pipecat] uuid_audio_stream sonucu: " .. tostring(result) .. "\n")
 
 if tostring(result):find("OK") then
-    freeswitch.consoleLog("INFO", "[Pipecat] Stream BAŞARILI - Pipecat WS bağlantısı kurulmalı!\n")
+    freeswitch.consoleLog("INFO", "[Pipecat] STREAM BAŞARILI! Pipecat WS bağlantısı kurulmalı.\n")
 end
 
--- Park ile channel'ı canlı tut (zombie olduğu için BYE gelse bile Lua devam eder)
-freeswitch.consoleLog("INFO", "[Pipecat] Park başlıyor (zombie mod)...\n")
-session:execute("park", "")
+-- PARK YERİNE ALIVE LOOP (zombie_exec'e gerek kalmaz)
+freeswitch.consoleLog("INFO", "[Pipecat] Channel alive loop başladı (karşı taraf kapatsa bile Lua devam eder)...\n")
 
-freeswitch.consoleLog("INFO", "[Pipecat] Script sonlandı.\n")
+while session:ready() do
+    session:sleep(2000)
+end
+
+freeswitch.consoleLog("INFO", "[Pipecat] Session bitti, script sonlandı.\n")
