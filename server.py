@@ -277,8 +277,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"pipecat_call_id={call_id},"
         f"pipecat_ws_url=ws://pipecatcon:8000/ws?call_id={call_id},"
         f"ignore_early_media=true,"
-        f"progress_timeout=60,"
-        f"absolute_codec_string=PCMU,"   
+        f"progress_timeout=60,"  
         f"}}sofia/gateway/netgsm/{request.phone_number} "
         f"&lua(pipecat_connect.lua)"
     )
