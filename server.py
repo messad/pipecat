@@ -274,12 +274,12 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
+        f"pipecat_ws_url=ws://10.0.1.7:8000/ws?call_id={call_id},"
         f"ignore_early_media=true,"
         f"progress_timeout=60,"
         f"absolute_codec_string=PCMU,"   
-        f"ws_url={ws_url}"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
-        f"&lua(pipecat_connect.lua {call_id})"
+        f"&lua(pipecat_connect.lua)"
     )
            
     try:
