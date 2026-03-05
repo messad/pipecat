@@ -97,16 +97,16 @@ def service_factory(config: dict):
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
             live_options=LiveOptions(
-                model: stt_model,
-                language: stt_language,
-                encoding: "linear16",
-                sample_rate: stt_sample_rate,
-                channels: 1,
-                interim_results: True,
-                punctuate: True,
-                smart_format: False,   # smart_format kapalı - nova-3 ile 400 riski var
-                vad_events: False,
-                profanity_filter: False,
+                model = stt_model,
+                language = stt_language,
+                encoding = "linear16",
+                sample_rate = stt_sample_rate,
+                channels = 1,
+                interim_results = True,
+                punctuate = True,
+                smart_format = False,   # smart_format kapalı - nova-3 ile 400 riski var
+                vad_events = False,
+                profanity_filter = False,
             )
         )
     else:
