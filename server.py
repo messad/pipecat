@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import logging
 from typing import Dict, Any, Optional
+from deepgram import LiveOptions
 
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -95,7 +96,7 @@ def service_factory(config: dict):
         # bu yüzden sadece zorunlu parametreleri gönderiyoruz
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options={
+            live_options=LiveOptions{
                 "model": stt_model,
                 "language": stt_language,
                 "encoding": "linear16",
