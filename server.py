@@ -99,7 +99,7 @@ def service_factory(config: dict):
             live_options=LiveOptions(
                 model = stt_model,
                 language = stt_language,
-                encoding = "linear16",
+                encoding = "mulaw",
                 sample_rate = stt_sample_rate,
                 channels = 1,
                 interim_results = True,
