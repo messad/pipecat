@@ -96,7 +96,7 @@ def service_factory(config: dict):
         # bu yüzden sadece zorunlu parametreleri gönderiyoruz
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options=LiveOptions{
+            live_options=LiveOptions(
                 "model": stt_model,
                 "language": stt_language,
                 "encoding": "linear16",
@@ -107,7 +107,7 @@ def service_factory(config: dict):
                 "smart_format": False,   # smart_format kapalı - nova-3 ile 400 riski var
                 "vad_events": False,
                 "profanity_filter": False,
-            }
+            )
         )
     else:
         raise ValueError(f"Desteklenmeyen STT provider: {stt_provider}")
