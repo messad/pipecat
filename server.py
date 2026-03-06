@@ -232,6 +232,7 @@ class WebSocketOutput(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         
+        # MÜKEMMEL FİLTRE: Hem normal sesi hem Cartesia TTS sesini yakala, AMA kullanıcının sesini (Input) es geç!
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             try:
                 await self.websocket.send_bytes(frame.audio)
