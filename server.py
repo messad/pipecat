@@ -103,7 +103,7 @@ def service_factory(config: dict):
                 interim_results = True,
                 punctuate = True,
                 smart_format = False,   # smart_format kapalı - nova-3 ile 400 riski var
-                vad_events = true,
+                vad_events = True,
                 endpointing=300,
                 profanity_filter = False,
             )
