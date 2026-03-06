@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -28,7 +28,14 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
+from pipecat.frames.frames import (
+    LLMMessagesFrame, 
+    AudioRawFrame, 
+    EndFrame, 
+    ErrorFrame,
+    TranscriptionFrame,
+    TextFrame
+)
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -50,7 +57,7 @@ class OutboundCallRequest(BaseModel):
 
     # STT
     stt_provider: Optional[str] = "deepgram"
-    stt_model: Optional[str] = "nova-3"          # nova-3 destekli model adı
+    stt_model: Optional[str] = "nova-3"         # nova-3 destekli model adı
     stt_language: Optional[str] = "tr"
     stt_sample_rate: Optional[int] = 8000
 
@@ -161,9 +168,24 @@ class WebSocketOutput(FrameProcessor):
         if isinstance(frame, AudioRawFrame):
             try:
                 await self.websocket.send_bytes(frame.audio)
+                logger.debug(f"[ÇIKIŞ] TTS'ten FreeSWITCH'e {len(frame.audio)} byte ses gönderildi.")
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
 
+# --- EKLENEN YENİ İZLEME (DEBUG) SINIFLARI ---
+class STTLogger(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            logger.info(f"🎙️ [STT DUYDU]: {frame.text}")
+
+class LLMLogger(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TextFrame):
+            logger.info(f"🧠 [LLM CEVAP ÜRETTİ]: {frame.text}")
+        elif isinstance(frame, LLMMessagesFrame):
+            logger.debug(f"📤 [LLM'E MESAJ GİDİYOR]: {frame.messages}")
 
 async def websocket_input(websocket: WebSocket):
     try:
@@ -173,7 +195,7 @@ async def websocket_input(websocket: WebSocket):
                 logger.info(f"FreeSWITCH Metadata: {message['text']}")
                 continue
             elif 'bytes' in message and message['bytes']:
-                logger.info(f"Binary ses paketi geldi! Boyut: {len(message['bytes'])} bytes")
+                # Gürültüyü azaltmak için her baytı loglamıyoruz, sadece STT'nin ne duyduğuna odaklanacağız
                 yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
             elif message.get('type') == 'websocket.disconnect':
                 logger.info("WebSocket disconnect yakalandı.")
@@ -190,6 +212,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"📡 WS Bağlantısı - Query Params: {dict(websocket.query_params)}")
     logger.info(f"📡 WS Bağlantısı - Headers: {dict(websocket.headers)}")
     logger.info(f"📡 WS Bağlantısı - call_id alındı: {websocket.query_params.get('call_id')}")
+    
     call_id = websocket.query_params.get("call_id")
     if not call_id or call_id not in active_call_configs:
         logger.error(f"Geçersiz veya eksik call_id: {call_id}. Bağlantı reddediliyor.")
@@ -201,10 +224,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
     output_processor = WebSocketOutput(websocket)
+    
+    # İzleyici Sınıfların Örnekleri
+    stt_logger = STTLogger()
+    llm_logger = LLMLogger()
 
     pipeline = Pipeline([
         stt,
+        stt_logger, # STT'den ne çıkıyor izleyelim
         context_aggregator_pair.user(),
+        llm_logger, # LLM'e ne giriyor, ne çıkıyor izleyelim
         llm,
         tts,
         output_processor,
@@ -214,15 +243,18 @@ async def websocket_endpoint(websocket: WebSocket):
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
 
+    # --- COLD START (İlk Söz) EKLENTİSİ ---
+    logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
+    initial_message = LLMMessagesFrame([{
+        "role": "user",
+        "content": "Telefon bağlandı. Bana hemen kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
+    }])
+    await task.queue_frame(initial_message)
+
     async def push_audio():
         try:
             async for frame in websocket_input(websocket):
-                if isinstance(frame, AudioRawFrame):
-                    logger.info(f"Audio frame alındı! Uzunluk: {len(frame.audio)} bytes, "
-                                f"sample_rate: {frame.sample_rate}, channels: {frame.num_channels}")
-                else:
-                    logger.debug(f"Non-audio frame: {type(frame).__name__}")
-                
+                # Gereksiz frame boyut loglarını kapattık, STT'nin algılamasını izleyeceğiz
                 await task.queue_frame(frame)
         except WebSocketDisconnect:
             logger.info("WebSocket istemci tarafından kapatıldı (normal çıkış).")
@@ -276,7 +308,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"}}sofia/gateway/netgsm/{request.phone_number} "
         f"&lua(pipecat_connect.lua)"
     )
-           
+            
     try:
         result = await esl_originate(originate_cmd)
         logger.info(f"ESL cevabı: {result}")
