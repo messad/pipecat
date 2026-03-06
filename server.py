@@ -29,14 +29,17 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.frames.frames import (
-    LLMMessagesFrame, 
-    AudioRawFrame, 
-    EndFrame, 
-    ErrorFrame,
-    TranscriptionFrame,
-    TextFrame,
-    LLMMessagesUpdateFrame
+    LLMMessagesUpdateFrame, 
+    TranscriptionFrame, 
+    TextFrame
 )
+
+from pipecat.transports.network.fastapi_websocket import (
+    FastAPIWebsocketTransport,
+    FastAPIWebsocketParams,
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -45,7 +48,8 @@ app = FastAPI()
 
 active_call_configs: Dict[str, Any] = {}
 
-FS_HOST = os.getenv("FREESWITCH_HOST", "10.0.1.7")
+# IP yerine container adını kullanıyoruz (Değişiklik 4)
+FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://10.0.1.7:8000")
@@ -58,7 +62,7 @@ class OutboundCallRequest(BaseModel):
 
     # STT
     stt_provider: Optional[str] = "deepgram"
-    stt_model: Optional[str] = "nova-3"         # nova-3 destekli model adı
+    stt_model: Optional[str] = "nova-3"         
     stt_language: Optional[str] = "tr"
     stt_sample_rate: Optional[int] = 8000
 
@@ -97,23 +101,18 @@ def service_factory(config: dict):
     stt_sample_rate = config.get("stt_sample_rate", 8000)
 
     if stt_provider == "deepgram":
-        # nova-3 ile çalışan minimal ve güvenli parametreler
-        # utterance_end_ms ve endpointing nova-3 ile 400 hatasına yol açabiliyor
-        # bu yüzden sadece zorunlu parametreleri gönderiyoruz
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
             live_options=LiveOptions(
-                model = stt_model,
-                language = stt_language,
-                encoding = "mulaw",
-                sample_rate = stt_sample_rate,
-                channels = 1,
-                interim_results = True,
-                punctuate = True,
-                smart_format = False,   # smart_format kapalı - nova-3 ile 400 riski var
-                vad_events = True,
-                endpointing=300,
-                profanity_filter = False,
+                model=stt_model,
+                language=stt_language,
+                encoding="linear16", 
+                sample_rate=stt_sample_rate,
+                channels=1,
+                interim_results=True,
+                punctuate=True,
+                smart_format=False,
+                profanity_filter=False,
             )
         )
     else:
@@ -159,21 +158,6 @@ def service_factory(config: dict):
     return stt, llm, tts, context_aggregator_pair
 
 
-class WebSocketOutput(FrameProcessor):
-    def __init__(self, websocket: WebSocket):
-        super().__init__()
-        self.websocket = websocket
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, AudioRawFrame):
-            try:
-                await self.websocket.send_bytes(frame.audio)
-                logger.debug(f"[ÇIKIŞ] TTS'ten FreeSWITCH'e {len(frame.audio)} byte ses gönderildi.")
-            except Exception as e:
-                logger.error(f"WebSocket ses gönderme hatası: {e}")
-
-# --- EKLENEN YENİ İZLEME (DEBUG) SINIFLARI ---
 class STTLogger(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -185,34 +169,12 @@ class LLMLogger(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
             logger.info(f"🧠 [LLM CEVAP ÜRETTİ]: {frame.text}")
-        elif isinstance(frame, LLMMessagesFrame):
-            logger.debug(f"📤 [LLM'E MESAJ GİDİYOR]: {frame.messages}")
-
-async def websocket_input(websocket: WebSocket):
-    try:
-        while True:
-            message = await websocket.receive()
-            if 'text' in message and message['text']:
-                logger.info(f"FreeSWITCH Metadata: {message['text']}")
-                continue
-            elif 'bytes' in message and message['bytes']:
-                # Gürültüyü azaltmak için her baytı loglamıyoruz, sadece STT'nin ne duyduğuna odaklanacağız
-                yield AudioRawFrame(audio=message['bytes'], sample_rate=8000, num_channels=1)
-            elif message.get('type') == 'websocket.disconnect':
-                logger.info("WebSocket disconnect yakalandı.")
-                break
-    except Exception as e:
-        logger.error(f"WebSocket okuma hatası: {e}")
-    yield EndFrame()
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket bağlantısı kuruldu.")
-    logger.info(f"📡 WS Bağlantısı - Query Params: {dict(websocket.query_params)}")
-    logger.info(f"📡 WS Bağlantısı - Headers: {dict(websocket.headers)}")
-    logger.info(f"📡 WS Bağlantısı - call_id alındı: {websocket.query_params.get('call_id')}")
     
     call_id = websocket.query_params.get("call_id")
     if not call_id or call_id not in active_call_configs:
@@ -224,28 +186,41 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"Config başarıyla bulundu. call_id={call_id}")
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
-    output_processor = WebSocketOutput(websocket)
     
-    # İzleyici Sınıfların Örnekleri
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
 
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            # vad_enabled=True parametresi kaldırıldı (Değişiklik 3)
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=8000, 
+                params=VADParams(stop_secs=0.3, start_secs=0.15)
+            ),
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+        )
+    )
+
     pipeline = Pipeline([
+        transport.input(),              
         stt,
-        stt_logger, # STT'den ne çıkıyor izleyelim
+        stt_logger,                     
         context_aggregator_pair.user(),
-        llm_logger, # LLM'e ne giriyor, ne çıkıyor izleyelim
-        llm,
+        llm,                            
+        llm_logger,                     # LLM Logger doğru yere, LLM sonrasına alındı (Değişiklik 1)
         tts,
-        output_processor,
+        transport.output(),             
         context_aggregator_pair.assistant()
     ])
 
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
 
-    # --- COLD START (İlk Söz) EKLENTİSİ ---
-    logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
+    # --- COLD START (İlk Söz) GÜVENLİ ASYNC EKLENTİSİ (Değişiklik 2) ---
     initial_message = LLMMessagesUpdateFrame(
         messages=[{
             "role": "user",
@@ -253,29 +228,23 @@ async def websocket_endpoint(websocket: WebSocket):
         }],
         run_llm=True
     )
-    
-    await task.queue_frame(initial_message)
 
-    async def push_audio():
-        try:
-            async for frame in websocket_input(websocket):
-                # Gereksiz frame boyut loglarını kapattık, STT'nin algılamasını izleyeceğiz
-                await task.queue_frame(frame)
-        except WebSocketDisconnect:
-            logger.info("WebSocket istemci tarafından kapatıldı (normal çıkış).")
-            await task.queue_frame(EndFrame())
-        except Exception as e:
-            logger.error(f"Ses push hatası: {e}")
-            await task.queue_frame(ErrorFrame(f"Audio input error: {e}"))
-        # finally yok – runner doğal olarak bitsin, zorla iptal etme
+    async def run_pipeline():
+        await runner.run(task)
+
+    async def send_initial():
+        # Pipeline'ın StartFrame'i işleyip ayağa kalkması için ufak bir gecikme
+        await asyncio.sleep(0.5) 
+        logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
+        await task.queue_frame(initial_message)
 
     logger.info("Pipeline başlatılıyor...")
     try:
-        await asyncio.gather(runner.run(task), push_audio())
+        # İki görevi güvenli bir şekilde aynı anda çalıştırıyoruz
+        await asyncio.gather(run_pipeline(), send_initial())
     except Exception as e:
         logger.error(f"Pipeline genel hatası: {e}")
     finally:
-        # Sadece temizlik: config sil ve websocket kapat
         if call_id in active_call_configs:
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
@@ -283,6 +252,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
 
 @app.get("/")
 async def root():
@@ -307,7 +277,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
-        f"pipecat_ws_url=ws://pipecatcon:8000/ws?call_id={call_id},"
+        f"pipecat_ws_url={ws_url},"    # Hardcode URL yerine değişken kullanıldı (Değişiklik 5)
         f"ignore_early_media=true,"
         f"progress_timeout=60,"  
         f"}}sofia/gateway/netgsm/{request.phone_number} "
