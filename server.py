@@ -29,15 +29,17 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.frames.frames import (
-    LLMMessagesUpdateFrame, 
+    Frame,
+    StartFrame,              
+    EndFrame, 
+    ErrorFrame,
     TranscriptionFrame, 
-    TextFrame
+    TextFrame,
+    LLMMessagesUpdateFrame,
+    InputAudioRawFrame,      
+    AudioRawFrame            
 )
 
-from pipecat.transports.network.fastapi_websocket import (
-    FastAPIWebsocketTransport,
-    FastAPIWebsocketParams,
-)
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 
@@ -48,11 +50,10 @@ app = FastAPI()
 
 active_call_configs: Dict[str, Any] = {}
 
-# IP yerine container adını kullanıyoruz (Değişiklik 4)
 FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
-PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://10.0.1.7:8000")
+PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://pipecatcon:8000")
 
 
 class OutboundCallRequest(BaseModel):
@@ -121,9 +122,14 @@ def service_factory(config: dict):
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
 
+    vad_analyzer = SileroVADAnalyzer(
+        sample_rate=stt_sample_rate,
+        params=VADParams(stop_secs=0.3, start_secs=0.15)
+    )
+
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(),
+        user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer),
     )
 
     llm_provider = config.get("llm_provider", "openai")
@@ -145,7 +151,8 @@ def service_factory(config: dict):
     if tts_provider == "cartesia":
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
+            voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
+            sample_rate=8000 # <-- EKLENDİ (Cartesia'nın 8kHz formatında yanıt dönmesini kesinleştirir)
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -158,17 +165,85 @@ def service_factory(config: dict):
     return stt, llm, tts, context_aggregator_pair
 
 
+class FreeSWITCHInputProcessor(FrameProcessor):
+    def __init__(self, websocket: WebSocket):
+        super().__init__()
+        self.websocket = websocket
+        self._receive_task = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            if not self._receive_task:
+                logger.info("🟢 FreeSWITCHInputProcessor: StartFrame yakalandı, WebSocket okuma döngüsü başlıyor...")
+                self._receive_task = asyncio.create_task(self._receive_audio_loop())
+
+        await self.push_frame(frame, direction)
+
+    async def _receive_audio_loop(self):
+        try:
+            while True:
+                message = await self.websocket.receive()
+                if 'bytes' in message and message['bytes']:
+                    audio_frame = InputAudioRawFrame(
+                        audio=message['bytes'],
+                        sample_rate=8000,
+                        num_channels=1
+                    )
+                    await self.push_frame(audio_frame)
+                elif 'text' in message and message['text']:
+                    pass 
+                elif message.get('type') == 'websocket.disconnect':
+                    logger.info("FreeSWITCHInputProcessor: WebSocket bağlantısı kapandı.")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"FreeSWITCH WebSocket okuma hatası: {e}")
+        finally:
+            await self.push_frame(EndFrame())
+
+    # <-- EKLENDİ (Görev temizliği için)
+    async def cleanup(self):
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("🧹 FreeSWITCHInputProcessor: Okuma döngüsü başarıyla temizlendi.")
+
+
+class WebSocketOutput(FrameProcessor):
+    def __init__(self, websocket: WebSocket):
+        super().__init__()
+        self.websocket = websocket
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, AudioRawFrame):
+            try:
+                await self.websocket.send_bytes(frame.audio)
+            except Exception as e:
+                logger.error(f"WebSocket ses gönderme hatası: {e}")
+        
+        await self.push_frame(frame, direction)
+
+
 class STTLogger(FrameProcessor):
-    async def process_frame(self, frame, direction):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
             logger.info(f"🎙️ [STT DUYDU]: {frame.text}")
+        await self.push_frame(frame, direction)
 
 class LLMLogger(FrameProcessor):
-    async def process_frame(self, frame, direction):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
             logger.info(f"🧠 [LLM CEVAP ÜRETTİ]: {frame.text}")
+        await self.push_frame(frame, direction)
 
 
 @app.websocket("/ws")
@@ -187,40 +262,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
     
+    fs_input = FreeSWITCHInputProcessor(websocket)
+    fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
 
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            # vad_enabled=True parametresi kaldırıldı (Değişiklik 3)
-            vad_analyzer=SileroVADAnalyzer(
-                sample_rate=8000, 
-                params=VADParams(stop_secs=0.3, start_secs=0.15)
-            ),
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-        )
-    )
-
     pipeline = Pipeline([
-        transport.input(),              
-        stt,
+        fs_input,                       
+        stt,                            
         stt_logger,                     
-        context_aggregator_pair.user(),
+        context_aggregator_pair.user(), 
         llm,                            
-        llm_logger,                     # LLM Logger doğru yere, LLM sonrasına alındı (Değişiklik 1)
-        tts,
-        transport.output(),             
-        context_aggregator_pair.assistant()
+        llm_logger,                     
+        tts,                            
+        fs_output,                      
+        context_aggregator_pair.assistant() 
     ])
 
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
 
-    # --- COLD START (İlk Söz) GÜVENLİ ASYNC EKLENTİSİ (Değişiklik 2) ---
     initial_message = LLMMessagesUpdateFrame(
         messages=[{
             "role": "user",
@@ -233,18 +294,19 @@ async def websocket_endpoint(websocket: WebSocket):
         await runner.run(task)
 
     async def send_initial():
-        # Pipeline'ın StartFrame'i işleyip ayağa kalkması için ufak bir gecikme
         await asyncio.sleep(0.5) 
         logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
         await task.queue_frame(initial_message)
 
     logger.info("Pipeline başlatılıyor...")
     try:
-        # İki görevi güvenli bir şekilde aynı anda çalıştırıyoruz
         await asyncio.gather(run_pipeline(), send_initial())
     except Exception as e:
         logger.error(f"Pipeline genel hatası: {e}")
     finally:
+        # <-- EKLENDİ (Okuyucu görevini temizliyoruz)
+        await fs_input.cleanup()
+        
         if call_id in active_call_configs:
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
@@ -277,7 +339,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
-        f"pipecat_ws_url={ws_url},"    # Hardcode URL yerine değişken kullanıldı (Değişiklik 5)
+        f"pipecat_ws_url={ws_url},"    
         f"ignore_early_media=true,"
         f"progress_timeout=60,"  
         f"}}sofia/gateway/netgsm/{request.phone_number} "
