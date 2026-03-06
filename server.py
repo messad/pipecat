@@ -12,7 +12,12 @@ from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
+# GÜNCELLENDİ: Terminali boğan gereksiz WebSocket loglarını susturuyoruz
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
@@ -20,7 +25,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.groq import GroqLLMService  # <-- EKLENDİ (Groq desteği için)
+from pipecat.services.groq import GroqLLMService  
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -29,7 +34,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.transcriptions.language import Language  # <-- EKLENDİ (Dil Enum'u için)
+from pipecat.transcriptions.language import Language  
 from pipecat.frames.frames import (
     Frame,
     StartFrame,              
@@ -40,8 +45,8 @@ from pipecat.frames.frames import (
     LLMMessagesUpdateFrame,
     InputAudioRawFrame,      
     AudioRawFrame,
-    TTSAudioRawFrame,  # <-- EKLENDİ (Cartesia'dan gelen sesi yakalamak için)
-    OutputAudioRawFrame # <-- EKLENDİ (WebSocketOutput filtresi için)
+    TTSAudioRawFrame,  
+    OutputAudioRawFrame 
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -65,17 +70,14 @@ class OutboundCallRequest(BaseModel):
     caller_id: str = "2167064380"
     system_prompt: Optional[str] = "Sen yardımsever bir asistansın. Kısa ve net cevaplar ver."
 
-    # STT
     stt_provider: Optional[str] = "deepgram"
     stt_model: Optional[str] = "nova-3"         
     stt_language: Optional[str] = "tr"
     stt_sample_rate: Optional[int] = 8000
 
-    # LLM (Groq varsayılan yapıldı)
     llm_provider: Optional[str] = "groq"
     llm_model: Optional[str] = "llama-3.1-8b-instant"
 
-    # TTS
     tts_provider: Optional[str] = "cartesia"
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
 
@@ -126,13 +128,13 @@ def service_factory(config: dict):
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
 
-    # <-- GÜNCELLENDİ (Gecikmeyi önlemek için agresif VAD ayarları)
+    # GÜNCELLENDİ: Cartesia Context çökmesini önlemek için nefes payı (stop_secs) verildi
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.2,      
-            start_secs=0.15, 
-            min_volume=0.5,
+            stop_secs=0.5,      
+            start_secs=0.3, 
+            min_volume=0.6,
             confidence=0.75
         )
     )
@@ -157,7 +159,6 @@ def service_factory(config: dict):
             system=system_prompt
         )
     elif llm_provider == "groq":
-        # <-- EKLENDİ (Groq entegrasyonu)
         llm = GroqLLMService(
             api_key=os.getenv("GROQ_API_KEY"),
             model=config.get("llm_model", "llama-3.1-8b-instant")
@@ -172,9 +173,8 @@ def service_factory(config: dict):
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
             sample_rate=8000, 
             model="sonic-multilingual",
-            language=Language.TR,  # <-- GÜNCELLENDİ (Enum bırakıldı)
-            speed=1.0,             # <-- EKLENDİ
-            emotion=["neutral"]    # <-- EKLENDİ (Pipecat list formatı bekler)
+            language=None,  # GÜNCELLENDİ: Cartesia'nın doğru algılaması için salt metin
+            speed=1.0
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -245,7 +245,6 @@ class WebSocketOutput(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         
-        # MÜKEMMEL FİLTRE: Hem normal sesi hem Cartesia TTS sesini yakala, AMA kullanıcının sesini (Input) es geç!
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             try:
                 await self.websocket.send_bytes(frame.audio)
@@ -253,7 +252,6 @@ class WebSocketOutput(FrameProcessor):
                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
                     logger.info(f"🔊 [SES GÖNDERİLDİ] Asistanın {len(frame.audio)} byte sesi FreeSWITCH'e basıldı! (Paket #{self._log_counter})")
             except Exception as e:
-                # <-- EKLENDİ (Bağlantı kopmasını yakalayıp pipeline'ı çökertmeden nazikçe sonlandırma)
                 if "closed" in str(e).lower() or "disconnect" in str(e).lower():
                     logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor (beklenen)")
                     await self.push_frame(EndFrame())
@@ -326,7 +324,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await runner.run(task)
 
     async def send_initial():
-        await asyncio.sleep(0.5) 
+        # GÜNCELLENDİ: Bekleme kaldırıldı, açılır açılmaz konuşacak
         logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
         await task.queue_frame(initial_message)
 
