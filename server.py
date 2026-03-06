@@ -29,8 +29,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.frames.frames import LLMMessagesFrame, AudioRawFrame, EndFrame, ErrorFrame
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -105,7 +103,8 @@ def service_factory(config: dict):
                 interim_results = True,
                 punctuate = True,
                 smart_format = False,   # smart_format kapalı - nova-3 ile 400 riski var
-                vad_events = False,
+                vad_events = true,
+                endpointing=300,
                 profanity_filter = False,
             )
         )
@@ -121,7 +120,7 @@ def service_factory(config: dict):
 
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer),
+        user_params=LLMUserAggregatorParams(),
     )
 
     llm_provider = config.get("llm_provider", "openai")
