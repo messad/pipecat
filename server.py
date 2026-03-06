@@ -140,8 +140,7 @@ def service_factory(config: dict):
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad_analyzer,
-            turn_analyzer=None  # <-- GÜNCELLENDİ (Smart Turn kapatıldı, latency düşürüldü)
+            vad_analyzer=vad_analyzer
         ),
     )
 
