@@ -152,7 +152,9 @@ def service_factory(config: dict):
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
-            sample_rate=8000 # <-- EKLENDİ (Cartesia'nın 8kHz formatında yanıt dönmesini kesinleştirir)
+            sample_rate=8000, # <-- EKLENDİ (Cartesia'nın 8kHz formatında yanıt dönmesini kesinleştirir)
+            model="sonic-multilingual",
+            language="tr"
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
