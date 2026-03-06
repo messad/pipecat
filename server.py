@@ -34,7 +34,8 @@ from pipecat.frames.frames import (
     EndFrame, 
     ErrorFrame,
     TranscriptionFrame,
-    TextFrame
+    TextFrame,
+    LLMMessagesUpdateFrame
 )
 
 logger.remove()
@@ -245,10 +246,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # --- COLD START (İlk Söz) EKLENTİSİ ---
     logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
-    initial_message = LLMMessagesFrame([{
-        "role": "user",
-        "content": "Telefon bağlandı. Bana hemen kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
-    }])
+    initial_message = LLMMessagesUpdateFrame(
+        messages=[{
+            "role": "user",
+            "content": "Telefon bağlandı. Bana hemen kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
+        }],
+        run_llm=True
+    )
+    
     await task.queue_frame(initial_message)
 
     async def push_audio():
