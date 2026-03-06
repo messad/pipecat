@@ -28,6 +28,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.transcriptions.language import Language  # <-- EKLENDİ (Dil Enum'u için)
 from pipecat.frames.frames import (
     Frame,
     StartFrame,              
@@ -37,7 +38,8 @@ from pipecat.frames.frames import (
     TextFrame,
     LLMMessagesUpdateFrame,
     InputAudioRawFrame,      
-    AudioRawFrame            
+    AudioRawFrame,
+    TTSAudioRawFrame  # <-- EKLENDİ (Cartesia'dan gelen sesi yakalamak için)
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -122,9 +124,14 @@ def service_factory(config: dict):
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
 
+    # <-- GÜNCELLENDİ (Asistanın sözünün kesilmemesi için hassasiyet ayarı)
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
-        params=VADParams(stop_secs=0.3, start_secs=0.15)
+        params=VADParams(
+            stop_secs=0.5, 
+            start_secs=0.25, 
+            min_speech_duration=0.4
+        )
     )
 
     context_aggregator_pair = LLMContextAggregatorPair(
@@ -152,9 +159,9 @@ def service_factory(config: dict):
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
-            sample_rate=8000, # <-- EKLENDİ (Cartesia'nın 8kHz formatında yanıt dönmesini kesinleştirir)
+            sample_rate=8000, 
             model="sonic-multilingual",
-            language="tr"
+            language=Language.TR  # <-- GÜNCELLENDİ (Cartesia'nın doğru Türkçe okuması için String yerine Enum)
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -206,7 +213,6 @@ class FreeSWITCHInputProcessor(FrameProcessor):
         finally:
             await self.push_frame(EndFrame())
 
-    # <-- EKLENDİ (Görev temizliği için)
     async def cleanup(self):
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
@@ -224,9 +230,12 @@ class WebSocketOutput(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, AudioRawFrame):
+        
+        # <-- GÜNCELLENDİ (Hem AudioRawFrame hem de TTSAudioRawFrame yakalanıyor, log basılıyor)
+        if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame)):
             try:
                 await self.websocket.send_bytes(frame.audio)
+                logger.info(f"🔊 [SES GÖNDERİLDİ] FreeSWITCH'e {len(frame.audio)} byte ses gönderildi!")
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
         
@@ -306,7 +315,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Pipeline genel hatası: {e}")
     finally:
-        # <-- EKLENDİ (Okuyucu görevini temizliyoruz)
         await fs_input.cleanup()
         
         if call_id in active_call_configs:
