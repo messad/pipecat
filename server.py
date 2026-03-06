@@ -114,10 +114,6 @@ def service_factory(config: dict):
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
 
-    vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(stop_secs=0.3, start_secs=0.15)
-    )
-
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(),
