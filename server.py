@@ -227,15 +227,18 @@ class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
         self.websocket = websocket
+        self._log_counter = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         
-        # <-- GÜNCELLENDİ (Hem AudioRawFrame hem de TTSAudioRawFrame yakalanıyor, log basılıyor)
-        if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame)):
+        # MÜKEMMEL FİLTRE: Hem normal sesi hem Cartesia TTS sesini yakala, AMA kullanıcının sesini (Input) es geç!
+        if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             try:
                 await self.websocket.send_bytes(frame.audio)
-                logger.info(f"🔊 [SES GÖNDERİLDİ] FreeSWITCH'e {len(frame.audio)} byte ses gönderildi!")
+                self._log_counter += 1
+                if self._log_counter <= 5 or self._log_counter % 100 == 0:
+                    logger.info(f"🔊 [SES GÖNDERİLDİ] Asistanın {len(frame.audio)} byte sesi FreeSWITCH'e basıldı! (Paket #{self._log_counter})")
             except Exception as e:
                 logger.error(f"WebSocket ses gönderme hatası: {e}")
         
