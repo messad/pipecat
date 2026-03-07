@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import uuid
@@ -12,7 +11,6 @@ from pydantic import BaseModel
 from loguru import logger
 import uvicorn
 
-# Terminali boğan gereksiz WebSocket loglarını susturuyoruz
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 logging.getLogger("websockets.client").setLevel(logging.WARNING)
 logging.getLogger("websockets.server").setLevel(logging.WARNING)
@@ -25,7 +23,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.groq import GroqLLMService  
+from pipecat.services.groq import GroqLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -34,21 +32,21 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.transcriptions.language import Language  
+from pipecat.transcriptions.language import Language
 from pipecat.frames.frames import (
     Frame,
-    StartFrame,              
-    EndFrame, 
+    StartFrame,
+    EndFrame,
     ErrorFrame,
-    TranscriptionFrame, 
+    TranscriptionFrame,
     TextFrame,
     LLMMessagesUpdateFrame,
-    InputAudioRawFrame,      
+    InputAudioRawFrame,
     AudioRawFrame,
-    TTSAudioRawFrame,  
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     OutputAudioRawFrame,
-    BotStartedSpeakingFrame, 
-    BotStoppedSpeakingFrame  
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -73,7 +71,7 @@ class OutboundCallRequest(BaseModel):
     system_prompt: Optional[str] = "Sen yardımsever bir asistansın. Kısa ve net cevaplar ver."
 
     stt_provider: Optional[str] = "deepgram"
-    stt_model: Optional[str] = "nova-3"         
+    stt_model: Optional[str] = "nova-3"
     stt_language: Optional[str] = "tr"
     stt_sample_rate: Optional[int] = 8000
 
@@ -115,7 +113,7 @@ def service_factory(config: dict):
             live_options=LiveOptions(
                 model=stt_model,
                 language=stt_language,
-                encoding="linear16", 
+                encoding="linear16",
                 sample_rate=stt_sample_rate,
                 channels=1,
                 interim_results=True,
@@ -133,8 +131,8 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.5,      
-            start_secs=0.3, 
+            stop_secs=0.5,
+            start_secs=0.3,
             min_volume=0.6,
             confidence=0.75
         )
@@ -147,7 +145,6 @@ def service_factory(config: dict):
         ),
     )
 
-    # DÜZELTME 2: Default provider "groq" yapıldı
     llm_provider = config.get("llm_provider", "groq")
     if llm_provider == "openai":
         llm = OpenAILLMService(
@@ -173,12 +170,11 @@ def service_factory(config: dict):
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
-            sample_rate=8000, 
+            sample_rate=8000,
             model="sonic-multilingual",
-            language=Language.TR,  
+            language=Language.TR,
             speed=1.0,
-            # DÜZELTME 3: emotion string yapıldı
-            emotion="neutral"    
+            emotion="neutral",  # FIX: list değil string
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -190,12 +186,14 @@ def service_factory(config: dict):
 
     return stt, llm, tts, context_aggregator_pair
 
-# --- SHARED STATE YAPISI ---
+
+# --- SHARED STATE ---
 class BotSpeakingState:
     def __init__(self):
         self.is_speaking = False
 
-# 1. UPSTREAM SUPPRESSOR
+
+# --- UPSTREAM SUPPRESSOR ---
 class SoftwareEchoSuppressor(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
@@ -203,13 +201,14 @@ class SoftwareEchoSuppressor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
+        # Asistan konuşuyorsa mikrofon sesini düşür
         if isinstance(frame, InputAudioRawFrame) and self.state.is_speaking:
-            return  
-            
+            return
         await self.push_frame(frame, direction)
 
-# 2. DOWNSTREAM TRACKER 
+
+# --- DOWNSTREAM TRACKER ---
+# FIX: BotStartedSpeakingFrame yerine TTSStartedFrame/TTSStoppedFrame kullanılıyor
 class BotSpeakingTracker(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
@@ -217,17 +216,16 @@ class BotSpeakingTracker(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
-        if isinstance(frame, BotStartedSpeakingFrame):
-            logger.info("🔇 [AEC Durumu] Asistan konuşmaya başladı, mikrofona giden sesler kesiliyor.")
+        if isinstance(frame, TTSStartedFrame):
+            logger.info("🔇 [AEC] Asistan konuşmaya başladı, mikrofon kapatıldı.")
             self.state.is_speaking = True
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            logger.info("🔊 [AEC Durumu] Asistan sustu, mikrofon tekrar devrede.")
+        elif isinstance(frame, TTSStoppedFrame):
+            logger.info("🔊 [AEC] Asistan sustu, mikrofon açıldı.")
             self.state.is_speaking = False
-            
         await self.push_frame(frame, direction)
-# -----------------------------
 
+
+# --- FREESWITCH INPUT ---
 class FreeSWITCHInputProcessor(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -236,12 +234,10 @@ class FreeSWITCHInputProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
         if isinstance(frame, StartFrame):
             if not self._receive_task:
-                logger.info("🟢 FreeSWITCHInputProcessor: StartFrame yakalandı, WebSocket okuma döngüsü başlıyor...")
+                logger.info("🟢 FreeSWITCHInputProcessor: WebSocket okuma döngüsü başlıyor...")
                 self._receive_task = asyncio.create_task(self._receive_audio_loop())
-
         await self.push_frame(frame, direction)
 
     async def _receive_audio_loop(self):
@@ -254,18 +250,16 @@ class FreeSWITCHInputProcessor(FrameProcessor):
                         sample_rate=8000,
                         num_channels=1
                     )
-                    await self.push_frame(audio_frame)
-                elif 'text' in message and message['text']:
-                    pass 
+                    await self.push_frame(audio_frame, FrameDirection.DOWNSTREAM)
                 elif message.get('type') == 'websocket.disconnect':
-                    logger.info("FreeSWITCHInputProcessor: WebSocket bağlantısı kapandı.")
+                    logger.info("FreeSWITCHInputProcessor: WebSocket kapandı.")
                     break
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"FreeSWITCH WebSocket okuma hatası: {e}")
         finally:
-            await self.push_frame(EndFrame())
+            await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
     async def cleanup(self):
         if self._receive_task and not self._receive_task.done():
@@ -274,9 +268,10 @@ class FreeSWITCHInputProcessor(FrameProcessor):
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
-            logger.info("🧹 FreeSWITCHInputProcessor: Okuma döngüsü başarıyla temizlendi.")
+            logger.info("🧹 FreeSWITCHInputProcessor: Temizlendi.")
 
 
+# --- WEBSOCKET OUTPUT ---
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -285,28 +280,27 @@ class WebSocketOutput(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             try:
                 await self.websocket.send_bytes(frame.audio)
                 self._log_counter += 1
                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
-                    logger.info(f"🔊 [SES GÖNDERİLDİ] Asistanın {len(frame.audio)} byte sesi FreeSWITCH'e basıldı! (Paket #{self._log_counter})")
+                    logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
             except Exception as e:
                 if "closed" in str(e).lower() or "disconnect" in str(e).lower():
-                    logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor (beklenen)")
-                    # DÜZELTME 4: Ortadan EndFrame push etmiyoruz, pipeline'ı çökertmemesi için sadece logluyoruz
+                    logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor.")
+                    # FIX: EndFrame göndermiyoruz, sadece logluyoruz
                 else:
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
-        
         await self.push_frame(frame, direction)
 
 
+# --- DEBUG LOGGERS ---
 class STTLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
-            logger.info(f"🎙️ [STT DUYDU]: {frame.text}")
+            logger.info(f"🎙️ [STT]: {frame.text}")
         await self.push_frame(frame, direction)
 
 
@@ -314,7 +308,7 @@ class LLMLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
-            logger.info(f"🧠 [LLM CEVAP ÜRETTİ]: {frame.text}")
+            logger.info(f"🧠 [LLM]: {frame.text}")
         await self.push_frame(frame, direction)
 
 
@@ -322,40 +316,38 @@ class LLMLogger(FrameProcessor):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket bağlantısı kuruldu.")
-    
+
     call_id = websocket.query_params.get("call_id")
     if not call_id or call_id not in active_call_configs:
-        logger.error(f"Geçersiz veya eksik call_id: {call_id}. Bağlantı reddediliyor.")
+        logger.error(f"Geçersiz call_id: {call_id}")
         await websocket.close(code=1008, reason="Geçersiz veya eksik call_id")
         return
 
     config = active_call_configs[call_id]
-    logger.info(f"Config başarıyla bulundu. call_id={call_id}")
+    logger.info(f"Config bulundu. call_id={call_id}")
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
-    
+
+    bot_state = BotSpeakingState()
+    echo_suppressor = SoftwareEchoSuppressor(bot_state)
+    bot_tracker = BotSpeakingTracker(bot_state)
     fs_input = FreeSWITCHInputProcessor(websocket)
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
 
-    bot_state = BotSpeakingState()
-    
-    echo_suppressor = SoftwareEchoSuppressor(bot_state)
-    bot_tracker = BotSpeakingTracker(bot_state)
-
     pipeline = Pipeline([
-        fs_input,                       
-        echo_suppressor,                
-        stt,                            
-        stt_logger,                     
-        context_aggregator_pair.user(), 
-        llm,                            
-        llm_logger,                     
-        tts,                            
-        bot_tracker,                    
-        fs_output,                      
-        context_aggregator_pair.assistant() 
+        fs_input,
+        echo_suppressor,
+        stt,
+        stt_logger,
+        context_aggregator_pair.user(),
+        llm,
+        llm_logger,
+        tts,
+        bot_tracker,
+        fs_output,
+        context_aggregator_pair.assistant()
     ])
 
     runner = PipelineRunner()
@@ -364,7 +356,7 @@ async def websocket_endpoint(websocket: WebSocket):
     initial_message = LLMMessagesUpdateFrame(
         messages=[{
             "role": "user",
-            "content": "Telefon bağlandı. Bana hemen kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
+            "content": "Telefon bağlandı. Kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
         }],
         run_llm=True
     )
@@ -373,19 +365,17 @@ async def websocket_endpoint(websocket: WebSocket):
         await runner.run(task)
 
     async def send_initial():
-        # DÜZELTME 1: Race condition için sleep eklendi
-        await asyncio.sleep(0.5)
-        logger.info("Asistanı uyandırmak için İlk Söz (Cold Start) mesajı gönderiliyor...")
+        await asyncio.sleep(0.5)  # FIX: pipeline kurulana kadar bekle
+        logger.info("Cold Start mesajı gönderiliyor...")
         await task.queue_frame(initial_message)
 
     logger.info("Pipeline başlatılıyor...")
     try:
         await asyncio.gather(run_pipeline(), send_initial())
     except Exception as e:
-        logger.error(f"Pipeline genel hatası: {e}")
+        logger.error(f"Pipeline hatası: {e}")
     finally:
         await fs_input.cleanup()
-        
         if call_id in active_call_configs:
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
@@ -418,13 +408,13 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
         f"origination_caller_id_number={request.caller_id},"
         f"origination_caller_id_name=AI_Asistan,"
         f"pipecat_call_id={call_id},"
-        f"pipecat_ws_url={ws_url},"    
+        f"pipecat_ws_url={ws_url},"
         f"ignore_early_media=true,"
-        f"progress_timeout=60,"  
+        f"progress_timeout=60,"
         f"}}sofia/gateway/netgsm/{request.phone_number} "
         f"&lua(pipecat_connect.lua)"
     )
-            
+
     try:
         result = await esl_originate(originate_cmd)
         logger.info(f"ESL cevabı: {result}")
@@ -432,6 +422,7 @@ async def start_outbound_call(request: OutboundCallRequest, background_tasks: Ba
     except Exception as e:
         logger.error(f"ESL hatası: {e}")
         return {"status": "esl_error", "error": str(e), "call_id": call_id}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
