@@ -3,6 +3,8 @@ import sys
 import uuid
 import asyncio
 import logging
+import base64
+import json
 from typing import Dict, Any, Optional
 from deepgram import LiveOptions
 
@@ -272,6 +274,28 @@ class FreeSWITCHInputProcessor(FrameProcessor):
 
 
 # --- WEBSOCKET OUTPUT ---
+# class WebSocketOutput(FrameProcessor):
+#     def __init__(self, websocket: WebSocket):
+#         super().__init__()
+#         self.websocket = websocket
+#         self._log_counter = 0
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
+#             try:
+#                 await self.websocket.send_bytes(frame.audio)
+#                 self._log_counter += 1
+#                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
+#                     logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
+#             except Exception as e:
+#                 if "closed" in str(e).lower() or "disconnect" in str(e).lower():
+#                     logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor.")
+#                     # FIX: EndFrame göndermiyoruz, sadece logluyoruz
+#                 else:
+#                     logger.error(f"WebSocket ses gönderme hatası: {e}")
+#         await self.push_frame(frame, direction)
+
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -282,18 +306,24 @@ class WebSocketOutput(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             try:
-                await self.websocket.send_bytes(frame.audio)
+                payload = json.dumps({
+                    "type": "streamAudio",
+                    "data": {
+                        "audioDataType": "raw",
+                        "sampleRate": 8000,
+                        "audioData": base64.b64encode(frame.audio).decode("utf-8")
+                    }
+                })
+                await self.websocket.send_text(payload)
                 self._log_counter += 1
                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
                     logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
             except Exception as e:
                 if "closed" in str(e).lower() or "disconnect" in str(e).lower():
-                    logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor.")
-                    # FIX: EndFrame göndermiyoruz, sadece logluyoruz
+                    logger.warning("FreeSWITCH bağlantısı kapandı.")
                 else:
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
         await self.push_frame(frame, direction)
-
 
 # --- DEBUG LOGGERS ---
 class STTLogger(FrameProcessor):
