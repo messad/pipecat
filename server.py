@@ -46,7 +46,9 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,      
     AudioRawFrame,
     TTSAudioRawFrame,  
-    OutputAudioRawFrame 
+    OutputAudioRawFrame,
+    BotStartedSpeakingFrame, # <-- EKLENDİ (Yankı önleyici için)
+    BotStoppedSpeakingFrame  # <-- EKLENDİ (Yankı önleyici için)
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -173,8 +175,9 @@ def service_factory(config: dict):
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
             sample_rate=8000, 
             model="sonic-multilingual",
-            language=None,  # GÜNCELLENDİ: Cartesia'nın doğru algılaması için salt metin
-            speed=1.0
+            language=Language.TR,  # GÜNCELLENDİ: Cartesia'nın doğru algılaması için enum geri getirildi
+            speed=1.0,
+            emotion=["neutral"]    # EKLENDİ: Multilingual model stabilizasyonu için
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -236,6 +239,29 @@ class FreeSWITCHInputProcessor(FrameProcessor):
             logger.info("🧹 FreeSWITCHInputProcessor: Okuma döngüsü başarıyla temizlendi.")
 
 
+# <-- EKLENDİ (Asistan konuşurken mikrofonu susturan yazılımsal yankı engelleyici)
+class SoftwareEchoSuppressor(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.is_bot_speaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStartedSpeakingFrame):
+            logger.info("🔇 [AEC] Asistan konuşuyor, mikrofon susturuldu (Yankı engelleniyor).")
+            self.is_bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            logger.info("🔊 [AEC] Asistan sustu, mikrofon açıldı.")
+            self.is_bot_speaking = False
+
+        # Asistan konuşurken mikrofondan gelen sesleri STT'ye göndermeden düşür
+        if isinstance(frame, InputAudioRawFrame) and self.is_bot_speaking:
+            return
+
+        await self.push_frame(frame, direction)
+
+
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -293,12 +319,14 @@ async def websocket_endpoint(websocket: WebSocket):
     stt, llm, tts, context_aggregator_pair = service_factory(config)
     
     fs_input = FreeSWITCHInputProcessor(websocket)
+    echo_suppressor = SoftwareEchoSuppressor()  # <-- EKLENDİ
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
 
     pipeline = Pipeline([
         fs_input,                       
+        echo_suppressor,                # <-- EKLENDİ (Yankıyı pipeline'ın başında kesiyoruz)
         stt,                            
         stt_logger,                     
         context_aggregator_pair.user(), 
