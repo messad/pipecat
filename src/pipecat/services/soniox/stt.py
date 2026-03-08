@@ -6,10 +6,10 @@
 
 """Soniox speech-to-text service implementation."""
 
-import asyncio
 import json
 import time
-from typing import AsyncGenerator, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, List, Optional
 
 from loguru import logger
 from pydantic import BaseModel
@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, _warn_deprecated_param
 from pipecat.services.stt_latency import SONIOX_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
@@ -78,6 +79,9 @@ class SonioxContextObject(BaseModel):
 class SonioxInputParams(BaseModel):
     """Real-time transcription settings.
 
+    .. deprecated:: 0.0.105
+        Use ``settings=SonioxSTTSettings(...)`` instead.
+
     See Soniox WebSocket API documentation for more details:
     https://soniox.com/docs/speech-to-text/api-reference/websocket-api#configuration-parameters
 
@@ -93,7 +97,7 @@ class SonioxInputParams(BaseModel):
         client_reference_id: Client reference ID to use for transcription.
     """
 
-    model: str = "stt-rt-preview"
+    model: str = "stt-rt-v4"
 
     audio_format: Optional[str] = "pcm_s16le"
     num_channels: Optional[int] = 1
@@ -135,6 +139,31 @@ def _prepare_language_hints(
     return list(set(prepared_languages))
 
 
+@dataclass
+class SonioxSTTSettings(STTSettings):
+    """Settings for SonioxSTTService.
+
+    Parameters:
+        language_hints: List of language hints to use for transcription.
+        language_hints_strict: If true, strictly enforce language hints.
+        context: Customization for transcription. String for models with
+            context_version 1 and SonioxContextObject for models with
+            context_version 2.
+        enable_speaker_diarization: Whether to enable speaker diarization.
+        enable_language_identification: Whether to enable language identification.
+        client_reference_id: Client reference ID to use for transcription.
+    """
+
+    language_hints: List[Language] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_hints_strict: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    context: SonioxContextObject | str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_speaker_diarization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_language_identification: bool | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    client_reference_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
 class SonioxSTTService(WebsocketSTTService):
     """Speech-to-Text service using Soniox's WebSocket API.
 
@@ -145,14 +174,20 @@ class SonioxSTTService(WebsocketSTTService):
     For complete API documentation, see: https://soniox.com/docs/speech-to-text/api-reference/websocket-api
     """
 
+    _settings: SonioxSTTSettings
+
     def __init__(
         self,
         *,
         api_key: str,
         url: str = "wss://stt-rt.soniox.com/transcribe-websocket",
         sample_rate: Optional[int] = None,
+        model: Optional[str] = None,
+        audio_format: str = "pcm_s16le",
+        num_channels: int = 1,
         params: Optional[SonioxInputParams] = None,
-        vad_force_turn_endpoint: bool = False,
+        vad_force_turn_endpoint: bool = True,
+        settings: Optional[SonioxSTTSettings] = None,
         ttfs_p99_latency: Optional[float] = SONIOX_TTFS_P99,
         **kwargs,
     ):
@@ -162,27 +197,95 @@ class SonioxSTTService(WebsocketSTTService):
             api_key: Soniox API key.
             url: Soniox WebSocket API URL.
             sample_rate: Audio sample rate.
+            model: Soniox model to use for transcription.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SonioxSTTSettings(model=...)`` instead.
+
+            audio_format: Audio format for transcription. Defaults to ``"pcm_s16le"``.
+            num_channels: Number of audio channels. Defaults to 1.
             params: Additional configuration parameters, such as language hints, context and
                 speaker diarization.
-            vad_force_turn_endpoint: Listen to `VADUserStoppedSpeakingFrame` to send finalize message to Soniox. If disabled, Soniox will detect the end of the speech.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SonioxSTTSettings(...)`` instead.
+
+            vad_force_turn_endpoint: Listen to `VADUserStoppedSpeakingFrame` to send finalize message to Soniox.
+                If disabled, Soniox will detect the end of the speech. Defaults to True.
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
                 Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to the STTService.
         """
-        super().__init__(sample_rate=sample_rate, ttfs_p99_latency=ttfs_p99_latency, **kwargs)
-        params = params or SonioxInputParams()
+        # --- 1. Hardcoded defaults ---
+        default_settings = SonioxSTTSettings(
+            model="stt-rt-v4",
+            language=None,
+            language_hints=None,
+            language_hints_strict=None,
+            context=None,
+            enable_speaker_diarization=False,
+            enable_language_identification=False,
+            client_reference_id=None,
+        )
+
+        # --- 2. Deprecated direct-arg overrides ---
+        if model is not None:
+            _warn_deprecated_param("model", SonioxSTTSettings, "model")
+            default_settings.model = model
+
+        # --- 3. Deprecated params overrides ---
+        if params is not None:
+            _warn_deprecated_param("params", SonioxSTTSettings)
+            if not settings:
+                default_settings.model = params.model
+                if params.audio_format is not None:
+                    audio_format = params.audio_format
+                if params.num_channels is not None:
+                    num_channels = params.num_channels
+                default_settings.language_hints = params.language_hints
+                default_settings.language_hints_strict = params.language_hints_strict
+                default_settings.context = params.context
+                default_settings.enable_speaker_diarization = params.enable_speaker_diarization
+                default_settings.enable_language_identification = (
+                    params.enable_language_identification
+                )
+                default_settings.client_reference_id = params.client_reference_id
+
+        # --- 4. Settings delta (canonical API, always wins) ---
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=1,
+            keepalive_interval=5,
+            settings=default_settings,
+            **kwargs,
+        )
 
         self._api_key = api_key
         self._url = url
-        self.set_model_name(params.model)
-        self._params = params
         self._vad_force_turn_endpoint = vad_force_turn_endpoint
+
+        # Init-only audio config
+        self._audio_format = audio_format
+        self._num_channels = num_channels
 
         self._final_transcription_buffer = []
         self._last_tokens_received: Optional[float] = None
 
         self._receive_task = None
-        self._keepalive_task = None
+
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True, as Soniox STT supports metrics generation.
+        """
+        return True
 
     async def start(self, frame: StartFrame):
         """Start the Soniox STT websocket connection.
@@ -192,6 +295,23 @@ class SonioxSTTService(WebsocketSTTService):
         """
         await super().start(frame)
         await self._connect()
+
+    async def _update_settings(self, delta: SonioxSTTSettings) -> dict[str, Any]:
+        """Apply settings delta and reconnect if anything changed.
+
+        Args:
+            delta: A settings delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+
+        if changed:
+            await self._disconnect()
+            await self._connect()
+
+        return changed
 
     async def stop(self, frame: EndFrame):
         """Stop the Soniox STT websocket connection.
@@ -228,10 +348,8 @@ class SonioxSTTService(WebsocketSTTService):
         Yields:
             Frame: None (transcription results come via WebSocket callbacks).
         """
-        await self.start_processing_metrics()
         if self._websocket and self._websocket.state is State.OPEN:
             await self._websocket.send(audio)
-        await self.stop_processing_metrics()
 
         yield None
 
@@ -268,15 +386,12 @@ class SonioxSTTService(WebsocketSTTService):
 
         Establishes websocket connection and starts receive and keepalive tasks.
         """
-        await super()._connect()
-
         await self._connect_websocket()
+
+        await super()._connect()
 
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
-
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
         """Disconnect from the Soniox service.
@@ -284,10 +399,6 @@ class SonioxSTTService(WebsocketSTTService):
         Cleans up tasks and closes websocket connection.
         """
         await super()._disconnect()
-
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -313,24 +424,26 @@ class SonioxSTTService(WebsocketSTTService):
             # Either one or the other is required.
             enable_endpoint_detection = not self._vad_force_turn_endpoint
 
-            context = self._params.context
+            s = self._settings
+
+            context = s.context
             if isinstance(context, SonioxContextObject):
                 context = context.model_dump()
 
             # Send the initial configuration message.
             config = {
                 "api_key": self._api_key,
-                "model": self._model_name,
-                "audio_format": self._params.audio_format,
-                "num_channels": self._params.num_channels or 1,
+                "model": s.model,
+                "audio_format": self._audio_format,
+                "num_channels": self._num_channels,
                 "enable_endpoint_detection": enable_endpoint_detection,
                 "sample_rate": self.sample_rate,
-                "language_hints": _prepare_language_hints(self._params.language_hints),
-                "language_hints_strict": self._params.language_hints_strict,
+                "language_hints": _prepare_language_hints(s.language_hints),
+                "language_hints_strict": s.language_hints_strict,
                 "context": context,
-                "enable_speaker_diarization": self._params.enable_speaker_diarization,
-                "enable_language_identification": self._params.enable_language_identification,
-                "client_reference_id": self._params.client_reference_id,
+                "enable_speaker_diarization": s.enable_speaker_diarization,
+                "enable_language_identification": s.enable_language_identification,
+                "client_reference_id": s.client_reference_id,
             }
 
             # Send the configuration message.
@@ -417,6 +530,8 @@ class SonioxSTTService(WebsocketSTTService):
                             # the rest will be sent as interim tokens (even final tokens).
                             await send_endpoint_transcript()
                         else:
+                            if not self._final_transcription_buffer:
+                                await self.start_processing_metrics()
                             self._final_transcription_buffer.append(token)
                     else:
                         non_final_transcription.append(token)
@@ -461,17 +576,10 @@ class SonioxSTTService(WebsocketSTTService):
             except Exception as e:
                 logger.warning(f"Error processing message: {e}")
 
-    async def _keepalive_task_handler(self):
-        """Connection has to be open all the time."""
-        try:
-            while True:
-                logger.trace("Sending keepalive message")
-                if self._websocket and self._websocket.state is State.OPEN:
-                    await self._websocket.send(KEEPALIVE_MESSAGE)
-                else:
-                    logger.debug("WebSocket connection closed.")
-                    break
-                await asyncio.sleep(5)
+    async def _send_keepalive(self, silence: bytes):
+        """Send a Soniox protocol-level keepalive message.
 
-        except Exception as e:
-            logger.debug(f"Keepalive task stopped: {e}")
+        Args:
+            silence: Silent PCM audio bytes (unused, Soniox uses a protocol message).
+        """
+        await self._websocket.send(KEEPALIVE_MESSAGE)

@@ -7,13 +7,11 @@
 
 import os
 
-from deepgram import LiveOptions
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import Frame, LLMRunFrame
 from pipecat.pipeline.parallel_pipeline import ParallelPipeline
@@ -28,15 +26,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.filters.function_filter import FunctionFilter
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
+from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -47,12 +43,16 @@ class SwitchLanguage(ParallelPipeline):
 
         english_tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+            settings=CartesiaTTSSettings(
+                voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+            ),
         )
 
         spanish_tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="d4db5fb9-f44b-4bd1-85fa-192e0f0d75f9",  # Spanish-speaking Lady
+            settings=CartesiaTTSSettings(
+                voice="d4db5fb9-f44b-4bd1-85fa-192e0f0d75f9",  # Spanish-speaking Lady
+            ),
         )
 
         super().__init__(
@@ -101,12 +101,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
     stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"), live_options=LiveOptions(language="multi")
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        settings=DeepgramSTTSettings(
+            language="multi",
+        ),
     )
 
     tts = SwitchLanguage()
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMSettings(
+            system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities. Respond to what the user said in a creative and helpful way. Your output should not include non-alphanumeric characters. You can speak the following languages: 'English' and 'Spanish'.",
+        ),
+    )
     llm.register_function("switch_language", tts.switch_language)
 
     switch_language_function = FunctionSchema(
@@ -121,22 +129,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         required=["language"],
     )
     tools = ToolsSchema(standard_tools=[switch_language_function])
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities. Respond to what the user said in a creative and helpful way. Your output should not include non-alphanumeric characters. You can speak the following languages: 'English' and 'Spanish'.",
-        },
-    ]
-
-    context = LLMContext(messages, tools)
+    context = LLMContext(tools=tools)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
-            ),
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
     pipeline = Pipeline(
@@ -164,9 +160,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        messages.append(
+        context.add_message(
             {
-                "role": "system",
+                "role": "user",
                 "content": f"Please introduce yourself to the user and let them know the languages you speak. Your initial responses should be in {tts.current_language}.",
             }
         )

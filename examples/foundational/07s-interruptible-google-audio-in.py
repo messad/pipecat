@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from google.genai.types import Content, Part
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
@@ -37,14 +36,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.google.llm import GoogleLLMService
-from pipecat.services.google.tts import GoogleTTSService
+from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
+from pipecat.services.google.tts import GoogleTTSService, GoogleTTSSettings
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -99,7 +96,7 @@ class UserAudioCollector(FrameProcessor):
             self._user_speaking = True
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
-            self._context.add_audio_frames_message(audio_frames=self._audio_frames)
+            await self._context.add_audio_frames_message(audio_frames=self._audio_frames)
             await self._user_context_aggregator.push_frame(LLMRunFrame())
 
         elif isinstance(frame, InputAudioRawFrame):
@@ -219,39 +216,27 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     llm = GoogleLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
-        model="gemini-2.5-flash",
-        # force a certain amount of thinking if you want it
-        # params=GoogleLLMService.InputParams(
-        #     thinking=GoogleLLMService.ThinkingConfig(thinking_budget=4096)
-        # ),
+        settings=GoogleLLMSettings(
+            model="gemini-2.5-flash",
+            system_instruction=system_message,
+            # force a certain amount of thinking if you want it
+            # thinking=GoogleLLMService.ThinkingConfig(thinking_budget=4096)
+        ),
     )
 
     tts = GoogleTTSService(
-        voice_id="en-US-Chirp3-HD-Charon",
+        settings=GoogleTTSSettings(
+            voice="en-US-Chirp3-HD-Charon",
+            language=Language.EN_US,
+        ),
         params=GoogleTTSService.InputParams(language=Language.EN_US),
         credentials=os.getenv("GOOGLE_TEST_CREDENTIALS"),
     )
 
-    messages = [
-        {
-            "role": "system",
-            "content": system_message,
-        },
-        {
-            "role": "user",
-            "content": "Start by saying hello.",
-        },
-    ]
-
-    context = LLMContext(messages)
+    context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
-            ),
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
     audio_collector = UserAudioCollector(context, user_aggregator)
     pull_transcript_out_of_llm_output = TranscriptExtractor(context)
@@ -284,7 +269,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
+        context.add_message({"role": "user", "content": "Please introduce yourself to the user."})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")

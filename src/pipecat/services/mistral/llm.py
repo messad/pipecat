@@ -6,14 +6,24 @@
 
 """Mistral LLM service implementation using OpenAI-compatible interface."""
 
-from typing import List, Sequence
+from dataclasses import dataclass
+from typing import List, Optional, Sequence
 
 from loguru import logger
 from openai.types.chat import ChatCompletionMessageParam
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.frames.frames import FunctionCallFromLLM
+from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.settings import _warn_deprecated_param
+
+
+@dataclass
+class MistralLLMSettings(OpenAILLMSettings):
+    """Settings for MistralLLMService."""
+
+    pass
 
 
 class MistralLLMService(OpenAILLMService):
@@ -23,12 +33,15 @@ class MistralLLMService(OpenAILLMService):
     maintaining full compatibility with OpenAI's interface and functionality.
     """
 
+    _settings: MistralLLMSettings
+
     def __init__(
         self,
         *,
         api_key: str,
         base_url: str = "https://api.mistral.ai/v1",
-        model: str = "mistral-small-latest",
+        model: Optional[str] = None,
+        settings: Optional[MistralLLMSettings] = None,
         **kwargs,
     ):
         """Initialize the Mistral LLM service.
@@ -37,9 +50,29 @@ class MistralLLMService(OpenAILLMService):
             api_key: The API key for accessing Mistral's API.
             base_url: The base URL for Mistral API. Defaults to "https://api.mistral.ai/v1".
             model: The model identifier to use. Defaults to "mistral-small-latest".
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=OpenAILLMSettings(model=...)`` instead.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
-        super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = MistralLLMSettings(model="mistral-small-latest")
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            _warn_deprecated_param("model", MistralLLMSettings, "model")
+            default_settings.model = model
+
+        # 3. (No step 3, as there's no params object to apply)
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(api_key=api_key, base_url=base_url, settings=default_settings, **kwargs)
 
     def create_client(self, api_key=None, base_url=None, **kwargs):
         """Create OpenAI-compatible client for Mistral API endpoint.
@@ -180,24 +213,31 @@ class MistralLLMService(OpenAILLMService):
         fixed_messages = self._apply_mistral_fixups(params_from_context["messages"])
 
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
             "messages": fixed_messages,
             "tools": params_from_context["tools"],
             "tool_choice": params_from_context["tool_choice"],
-            "frequency_penalty": self._settings["frequency_penalty"],
-            "presence_penalty": self._settings["presence_penalty"],
-            "temperature": self._settings["temperature"],
-            "top_p": self._settings["top_p"],
-            "max_tokens": self._settings["max_tokens"],
+            "frequency_penalty": self._settings.frequency_penalty,
+            "presence_penalty": self._settings.presence_penalty,
+            "temperature": self._settings.temperature,
+            "top_p": self._settings.top_p,
+            "max_tokens": self._settings.max_tokens,
         }
 
         # Handle Mistral-specific parameter mapping
         # Mistral uses "random_seed" instead of "seed"
-        if self._settings["seed"]:
-            params["random_seed"] = self._settings["seed"]
+        if self._settings.seed:
+            params["random_seed"] = self._settings.seed
 
         # Add any extra parameters
-        params.update(self._settings["extra"])
+        params.update(self._settings.extra)
+
+        # Prepend system instruction if set
+        if self._settings.system_instruction:
+            messages = params.get("messages", [])
+            params["messages"] = [
+                {"role": "system", "content": self._settings.system_instruction}
+            ] + messages
 
         return params

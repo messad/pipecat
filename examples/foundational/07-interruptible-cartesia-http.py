@@ -6,10 +6,10 @@
 
 import os
 
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -23,13 +23,11 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.stt import CartesiaSTTService
-from pipecat.services.cartesia.tts import CartesiaHttpTTSService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.cartesia.tts import CartesiaHttpTTSService, CartesiaTTSSettings
+from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -55,69 +53,68 @@ transport_params = {
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = CartesiaSTTService(api_key=os.getenv("CARTESIA_API_KEY"))
+    async with aiohttp.ClientSession() as session:
+        stt = CartesiaSTTService(api_key=os.getenv("CARTESIA_API_KEY"))
 
-    tts = CartesiaHttpTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-    )
-
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
-        },
-    ]
-
-    context = LLMContext(messages)
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
+        tts = CartesiaHttpTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            aiohttp_session=session,
+            settings=CartesiaTTSSettings(
+                voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
             ),
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
-    )
+        )
 
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            stt,
-            user_aggregator,  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            assistant_aggregator,  # Assistant spoken responses
-        ]
-    )
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            settings=OpenAILLMSettings(
+                system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
+            ),
+        )
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
-    )
+        context = LLMContext()
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        )
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([LLMRunFrame()])
+        pipeline = Pipeline(
+            [
+                transport.input(),  # Transport user input
+                stt,
+                user_aggregator,  # User responses
+                llm,  # LLM
+                tts,  # TTS
+                transport.output(),  # Transport bot output
+                assistant_aggregator,  # Assistant spoken responses
+            ]
+        )
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
-        await task.cancel()
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+            idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
+        )
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected")
+            # Kick off the conversation.
+            context.add_message(
+                {"role": "user", "content": "Please introduce yourself to the user."}
+            )
+            await task.queue_frames([LLMRunFrame()])
 
-    await runner.run(task)
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
+            await task.cancel()
+
+        runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+
+        await runner.run(task)
 
 
 async def bot(runner_args: RunnerArguments):

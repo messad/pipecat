@@ -11,7 +11,6 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame, UserImageRequestFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -29,14 +28,12 @@ from pipecat.runner.utils import (
     get_transport_client_id,
     maybe_capture_participant_camera,
 )
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -93,11 +90,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        settings=CartesiaTTSSettings(
+            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        ),
     )
 
     # Google Gemini model for vision analysis
-    llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
+    llm = GoogleLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        settings=GoogleLLMSettings(
+            system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way. You are able to describe images from the user camera.",
+        ),
+    )
     llm.register_function("fetch_user_image", fetch_user_image)
 
     @llm.event_handler("on_function_calls_started")
@@ -121,22 +125,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     tools = ToolsSchema(standard_tools=[fetch_image_function])
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way. You are able to describe images from the user camera.",
-        },
-    ]
-
-    context = LLMContext(messages, tools)
+    context = LLMContext(tools=tools)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
-            ),
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
     pipeline = Pipeline(
@@ -170,9 +162,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         client_id = get_transport_client_id(transport, client)
 
         # Kick off the conversation.
-        messages.append(
+        context.add_message(
             {
-                "role": "system",
+                "role": "user",
                 "content": f"Please introduce yourself to the user. Use '{client_id}' as the user ID during function calls.",
             }
         )

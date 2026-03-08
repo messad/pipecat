@@ -16,6 +16,7 @@ Features:
     - Model-specific sample rates: mars-pro (48kHz), mars-flash (22.05kHz)
 """
 
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from camb import StreamTtsOutputConfiguration
@@ -28,9 +29,8 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
 )
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, _warn_deprecated_param
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -133,6 +133,18 @@ def _get_aligned_audio(buffer: bytes) -> tuple[bytes, bytes]:
     return buffer[:aligned_size], buffer[aligned_size:]
 
 
+@dataclass
+class CambTTSSettings(TTSSettings):
+    """Settings for CambTTSService.
+
+    Parameters:
+        user_instructions: Custom instructions for mars-instruct model only.
+            Ignored for other models. Max 1000 characters.
+    """
+
+    user_instructions: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
 class CambTTSService(TTSService):
     """Camb.ai MARS text-to-speech service using the official SDK.
 
@@ -156,8 +168,13 @@ class CambTTSService(TTSService):
         )
     """
 
+    _settings: CambTTSSettings
+
     class InputParams(BaseModel):
         """Input parameters for Camb.ai TTS configuration.
+
+        .. deprecated:: 0.0.105
+            Use ``settings=CambTTSSettings(...)`` instead.
 
         Parameters:
             language: Language for synthesis (BCP-47 format). Defaults to English.
@@ -177,51 +194,89 @@ class CambTTSService(TTSService):
         self,
         *,
         api_key: str,
-        voice_id: int = 147320,
-        model: str = "mars-flash",
+        voice_id: Optional[int] = None,
+        model: Optional[str] = None,
         timeout: float = 60.0,
         sample_rate: Optional[int] = None,
         params: Optional[InputParams] = None,
+        settings: Optional[CambTTSSettings] = None,
         **kwargs,
     ):
         """Initialize the Camb.ai TTS service.
 
         Args:
             api_key: Camb.ai API key for authentication.
-            voice_id: Voice ID to use. Defaults to 147320.
+            voice_id: Voice ID to use.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=CambTTSSettings(voice=...)`` instead.
+
             model: TTS model to use. Options: "mars-flash" (fast), "mars-pro" (high quality).
-                Defaults to "mars-flash".
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=CambTTSSettings(model=...)`` instead.
+
             timeout: Request timeout in seconds. Defaults to 60.0 (minimum recommended
                 by Camb.ai).
             sample_rate: Audio sample rate in Hz. If None, uses model-specific default.
             params: Additional voice parameters. If None, uses defaults.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=CambTTSSettings(...)`` instead.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional arguments passed to parent TTSService.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = CambTTSSettings(
+            model="mars-flash",
+            voice=147320,
+            language="en-us",
+            user_instructions=None,
+        )
 
-        self._api_key = api_key
-        self._timeout = timeout
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            _warn_deprecated_param("model", CambTTSSettings, "model")
+            default_settings.model = model
+        if voice_id is not None:
+            _warn_deprecated_param("voice_id", CambTTSSettings, "voice")
+            default_settings.voice = voice_id
 
-        params = params or CambTTSService.InputParams()
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            _warn_deprecated_param("params", CambTTSSettings)
+            if not settings:
+                if params.language is not None:
+                    default_settings.language = (
+                        self.language_to_service_language(params.language) or "en-us"
+                    )
+                if params.user_instructions is not None:
+                    default_settings.user_instructions = params.user_instructions
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
 
         # Warn if sample rate doesn't match model's supported rate
-        if sample_rate and sample_rate != MODEL_SAMPLE_RATES.get(model):
+        _model = default_settings.model
+        if sample_rate and sample_rate != MODEL_SAMPLE_RATES.get(_model):
             logger.warning(
-                f"Camb.ai's {model} model only supports {MODEL_SAMPLE_RATES.get(model)}Hz "
+                f"Camb.ai's {_model} model only supports {MODEL_SAMPLE_RATES.get(_model)}Hz "
                 f"sample rate. Current rate of {sample_rate}Hz may cause issues."
             )
 
-        # Build settings
-        self._settings = {
-            "language": (
-                self.language_to_service_language(params.language) if params.language else "en-us"
-            ),
-            "user_instructions": params.user_instructions,
-        }
+        super().__init__(
+            sample_rate=sample_rate,
+            push_start_frame=True,
+            push_stop_frames=True,
+            settings=default_settings,
+            **kwargs,
+        )
 
-        self.set_model_name(model)
-        self.set_voice(str(voice_id))
-        self._voice_id = voice_id
+        self._api_key = api_key
+        self._timeout = timeout
 
         self._client = None
 
@@ -256,14 +311,15 @@ class CambTTSService(TTSService):
 
         # Use model-specific sample rate if not explicitly specified
         if not self._init_sample_rate:
-            self._sample_rate = MODEL_SAMPLE_RATES.get(self.model_name, 22050)
+            self._sample_rate = MODEL_SAMPLE_RATES.get(self._settings.model, 22050)
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Camb.ai's TTS API.
 
         Args:
             text: The text to synthesize into speech (max 3000 characters).
+            context_id: The context ID for tracking audio frames.
 
         Yields:
             Frame: Audio frames containing the synthesized speech.
@@ -276,23 +332,20 @@ class CambTTSService(TTSService):
             text = text[:3000]
 
         try:
-            await self.start_ttfb_metrics()
-
             # Build SDK parameters
             tts_kwargs: Dict[str, Any] = {
                 "text": text,
-                "voice_id": self._voice_id,
-                "language": self._settings["language"],
-                "speech_model": self.model_name,
+                "voice_id": self._settings.voice,
+                "language": self._settings.language,
+                "speech_model": self._settings.model,
                 "output_configuration": StreamTtsOutputConfiguration(format="pcm_s16le"),
             }
 
             # Add user instructions if using mars-instruct model
-            if self._model_name == "mars-instruct" and self._settings.get("user_instructions"):
-                tts_kwargs["user_instructions"] = self._settings["user_instructions"]
+            if self._settings.model == "mars-instruct" and self._settings.user_instructions:
+                tts_kwargs["user_instructions"] = self._settings.user_instructions
 
             await self.start_tts_usage_metrics(text)
-            yield TTSStartedFrame()
 
             assert self._client is not None, "Camb.ai TTS service not initialized"
 
@@ -312,6 +365,7 @@ class CambTTSService(TTSService):
                             audio=aligned_audio,
                             sample_rate=self.sample_rate,
                             num_channels=1,
+                            context_id=context_id,
                         )
 
             # Yield any remaining complete samples
@@ -322,9 +376,8 @@ class CambTTSService(TTSService):
                         audio=aligned_audio,
                         sample_rate=self.sample_rate,
                         num_channels=1,
+                        context_id=context_id,
                     )
 
         except Exception as e:
             yield ErrorFrame(error=f"Camb.ai TTS error: {e}")
-        finally:
-            yield TTSStoppedFrame()

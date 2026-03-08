@@ -11,13 +11,23 @@ an OpenAI-compatible interface. It handles Perplexity's unique token usage
 reporting patterns while maintaining compatibility with the Pipecat framework.
 """
 
-from openai import NOT_GIVEN
+from dataclasses import dataclass
+from typing import Optional
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.settings import _warn_deprecated_param
+
+
+@dataclass
+class PerplexityLLMSettings(OpenAILLMSettings):
+    """Settings for PerplexityLLMService."""
+
+    pass
 
 
 class PerplexityLLMService(OpenAILLMService):
@@ -28,12 +38,15 @@ class PerplexityLLMService(OpenAILLMService):
     in token usage reporting between Perplexity (incremental) and OpenAI (final summary).
     """
 
+    _settings: PerplexityLLMSettings
+
     def __init__(
         self,
         *,
         api_key: str,
         base_url: str = "https://api.perplexity.ai",
-        model: str = "sonar",
+        model: Optional[str] = None,
+        settings: Optional[PerplexityLLMSettings] = None,
         **kwargs,
     ):
         """Initialize the Perplexity LLM service.
@@ -42,9 +55,29 @@ class PerplexityLLMService(OpenAILLMService):
             api_key: The API key for accessing Perplexity's API.
             base_url: The base URL for Perplexity's API. Defaults to "https://api.perplexity.ai".
             model: The model identifier to use. Defaults to "sonar".
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=OpenAILLMSettings(model=...)`` instead.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
-        super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = PerplexityLLMSettings(model="sonar")
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            _warn_deprecated_param("model", PerplexityLLMSettings, "model")
+            default_settings.model = model
+
+        # 3. (No step 3, as there's no params object to apply)
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(api_key=api_key, base_url=base_url, settings=default_settings, **kwargs)
         # Counters for accumulating token usage metrics
         self._prompt_tokens = 0
         self._completion_tokens = 0
@@ -66,22 +99,29 @@ class PerplexityLLMService(OpenAILLMService):
             Dictionary of parameters for the chat completion request.
         """
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
             "messages": params_from_context["messages"],
         }
 
         # Add OpenAI-compatible parameters if they're set
-        if self._settings["frequency_penalty"] is not NOT_GIVEN:
-            params["frequency_penalty"] = self._settings["frequency_penalty"]
-        if self._settings["presence_penalty"] is not NOT_GIVEN:
-            params["presence_penalty"] = self._settings["presence_penalty"]
-        if self._settings["temperature"] is not NOT_GIVEN:
-            params["temperature"] = self._settings["temperature"]
-        if self._settings["top_p"] is not NOT_GIVEN:
-            params["top_p"] = self._settings["top_p"]
-        if self._settings["max_tokens"] is not NOT_GIVEN:
-            params["max_tokens"] = self._settings["max_tokens"]
+        if self._settings.frequency_penalty is not None:
+            params["frequency_penalty"] = self._settings.frequency_penalty
+        if self._settings.presence_penalty is not None:
+            params["presence_penalty"] = self._settings.presence_penalty
+        if self._settings.temperature is not None:
+            params["temperature"] = self._settings.temperature
+        if self._settings.top_p is not None:
+            params["top_p"] = self._settings.top_p
+        if self._settings.max_tokens is not None:
+            params["max_tokens"] = self._settings.max_tokens
+
+        # Prepend system instruction if set
+        if self._settings.system_instruction:
+            messages = params.get("messages", [])
+            params["messages"] = [
+                {"role": "system", "content": self._settings.system_instruction}
+            ] + messages
 
         return params
 

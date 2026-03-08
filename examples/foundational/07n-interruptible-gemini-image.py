@@ -25,7 +25,6 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -38,14 +37,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.google.llm import GoogleLLMService
-from pipecat.services.google.stt import GoogleSTTService
-from pipecat.services.google.tts import GoogleTTSService
+from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
+from pipecat.services.google.stt import GoogleSTTService, GoogleSTTSettings
+from pipecat.services.google.tts import GoogleTTSService, GoogleTTSSettings
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -73,38 +70,33 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
     stt = GoogleSTTService(
-        params=GoogleSTTService.InputParams(languages=Language.EN_US),
         credentials=os.getenv("GOOGLE_TEST_CREDENTIALS"),
+        settings=GoogleSTTSettings(
+            languages=[Language.EN_US],
+        ),
     )
 
     tts = GoogleTTSService(
-        voice_id="en-US-Chirp3-HD-Charon",
-        params=GoogleTTSService.InputParams(language=Language.EN_US),
         credentials=os.getenv("GOOGLE_TEST_CREDENTIALS"),
+        settings=GoogleTTSSettings(
+            voice="en-US-Chirp3-HD-Charon",
+            language=Language.EN_US,
+        ),
     )
 
     llm = GoogleLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
-        model="gemini-2.5-flash-image",
-        # model="gemini-3-pro-image-preview", # A more powerful model, but slower
+        settings=GoogleLLMSettings(
+            model="gemini-2.5-flash-image",
+            # model="gemini-3-pro-image-preview", # A more powerful model, but slower,
+            system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
+        ),
     )
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
-        },
-    ]
-
-    context = LLMContext(messages)
+    context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
-            ),
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
     pipeline = Pipeline(
@@ -132,7 +124,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation with a styled introduction
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
+        context.add_message({"role": "user", "content": "Please introduce yourself to the user."})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")

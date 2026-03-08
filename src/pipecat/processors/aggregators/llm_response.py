@@ -581,7 +581,7 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
                     logger.debug(
                         "Interruption conditions met - pushing interruption and aggregation"
                     )
-                    await self.push_interruption_task_frame_and_wait()
+                    await self.broadcast_interruption()
                     await self._process_aggregation()
                 else:
                     logger.debug("Interruption conditions not met - not pushing aggregation")
@@ -1059,7 +1059,7 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
         await self.push_aggregation()
 
     async def _handle_text(self, frame: TextFrame):
-        if not self._started or not frame.append_to_context:
+        if not frame.append_to_context:
             return
 
         if self._params.expect_stripped_words:

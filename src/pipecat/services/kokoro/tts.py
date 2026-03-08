@@ -7,6 +7,7 @@
 """Kokoro TTS service implementation using kokoro-onnx."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -19,9 +20,8 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
 )
+from pipecat.services.settings import TTSSettings, _warn_deprecated_param
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -87,6 +87,13 @@ def language_to_kokoro_language(language: Language) -> str:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
+@dataclass
+class KokoroTTSSettings(TTSSettings):
+    """Settings for KokoroTTSService."""
+
+    pass
+
+
 class KokoroTTSService(TTSService):
     """Kokoro TTS service implementation.
 
@@ -94,8 +101,13 @@ class KokoroTTSService(TTSService):
     Automatically downloads model files on first use.
     """
 
+    _settings: KokoroTTSSettings
+
     class InputParams(BaseModel):
         """Input parameters for Kokoro TTS configuration.
+
+        .. deprecated:: 0.0.105
+            Use ``KokoroTTSSettings`` directly via the ``settings`` parameter instead.
 
         Parameters:
             language: Language to use for synthesis.
@@ -106,35 +118,68 @@ class KokoroTTSService(TTSService):
     def __init__(
         self,
         *,
-        voice_id: str,
+        voice_id: Optional[str] = None,
         model_path: Optional[str] = None,
         voices_path: Optional[str] = None,
         params: Optional[InputParams] = None,
+        settings: Optional[KokoroTTSSettings] = None,
         **kwargs,
     ):
         """Initialize the Kokoro TTS service.
 
         Args:
             voice_id: Voice identifier to use for synthesis.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=KokoroTTSSettings(voice=...)`` instead.
+
             model_path: Path to the kokoro ONNX model file. Defaults to auto-downloaded file.
             voices_path: Path to the voices binary file. Defaults to auto-downloaded file.
             params: Configuration parameters for synthesis.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=KokoroTTSSettings(...)`` instead.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional arguments passed to parent `TTSService`.
 
         """
-        super().__init__(**kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = KokoroTTSSettings(
+            model=None,
+            voice=None,
+            language=language_to_kokoro_language(Language.EN),
+        )
 
-        params = params or KokoroTTSService.InputParams()
+        # 2. Apply direct init arg overrides (deprecated)
+        if voice_id is not None:
+            _warn_deprecated_param("voice_id", KokoroTTSSettings, "voice")
+            default_settings.voice = voice_id
 
-        self._voice_id = voice_id
-        self._lang_code = language_to_kokoro_language(params.language)
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            _warn_deprecated_param("params", KokoroTTSSettings)
+            if not settings:
+                default_settings.language = language_to_kokoro_language(params.language)
 
-        model = Path(model_path) if model_path else KOKORO_CACHE_DIR / "kokoro-v1.0.onnx"
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            push_start_frame=True,
+            push_stop_frames=True,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        model_file = Path(model_path) if model_path else KOKORO_CACHE_DIR / "kokoro-v1.0.onnx"
         voices = Path(voices_path) if voices_path else KOKORO_CACHE_DIR / "voices-v1.0.bin"
 
-        _ensure_model_files(model, voices)
+        _ensure_model_files(model_file, voices)
 
-        self._kokoro = Kokoro(str(model), str(voices))
+        self._kokoro = Kokoro(str(model_file), str(voices))
 
         self._resampler = create_stream_resampler()
 
@@ -142,25 +187,35 @@ class KokoroTTSService(TTSService):
         """Indicate that this service supports TTFB and usage metrics."""
         return True
 
+    def language_to_service_language(self, language: Language) -> str:
+        """Convert a Language enum to kokoro-onnx language format.
+
+        Args:
+            language: The language to convert.
+
+        Returns:
+            The kokoro-onnx language code.
+        """
+        return language_to_kokoro_language(language)
+
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Synthesize speech from text using kokoro-onnx.
 
         Uses the async streaming API to generate audio frames.
 
         Args:
             text: The text to synthesize.
+            context_id: Unique identifier for this TTS context.
 
         """
         logger.debug(f"{self}: Generating TTS [{text}]")
 
         try:
-            await self.start_ttfb_metrics()
             await self.start_tts_usage_metrics(text)
-            yield TTSStartedFrame()
 
             stream = self._kokoro.create_stream(
-                text, voice=self._voice_id, lang=self._lang_code, speed=1.0
+                text, voice=self._settings.voice, lang=self._settings.language, speed=1.0
             )
 
             async for samples, sample_rate in stream:
@@ -172,10 +227,12 @@ class KokoroTTSService(TTSService):
                 )
 
                 yield TTSAudioRawFrame(
-                    audio=audio_data, sample_rate=self.sample_rate, num_channels=1
+                    audio=audio_data,
+                    sample_rate=self.sample_rate,
+                    num_channels=1,
+                    context_id=context_id,
                 )
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
         finally:
             await self.stop_ttfb_metrics()
-            yield TTSStoppedFrame()

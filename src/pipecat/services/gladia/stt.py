@@ -14,7 +14,8 @@ import asyncio
 import base64
 import json
 import warnings
-from typing import Any, AsyncGenerator, Dict, Literal, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Literal, Optional
 
 import aiohttp
 from loguru import logger
@@ -31,7 +32,14 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
-from pipecat.services.gladia.config import GladiaInputParams
+from pipecat.services.gladia.config import (
+    GladiaInputParams,
+    LanguageConfig,
+    MessagesConfig,
+    PreProcessingConfig,
+    RealtimeProcessingConfig,
+)
+from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, _warn_deprecated_param
 from pipecat.services.stt_latency import GLADIA_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
@@ -178,6 +186,37 @@ class _InputParamsDescriptor:
         return GladiaInputParams
 
 
+@dataclass
+class GladiaSTTSettings(STTSettings):
+    """Settings for GladiaSTTService.
+
+    Parameters:
+        language_config: Language detection and handling configuration.
+        custom_metadata: Additional metadata to include with requests.
+        endpointing: Silence duration in seconds to mark end of speech.
+        maximum_duration_without_endpointing: Maximum utterance duration without silence.
+        pre_processing: Audio pre-processing options.
+        realtime_processing: Real-time processing features.
+        messages_config: WebSocket message filtering options.
+        enable_vad: Enable VAD to trigger end of utterance detection.
+    """
+
+    language_config: LanguageConfig | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    custom_metadata: dict[str, Any] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    endpointing: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    maximum_duration_without_endpointing: int | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    pre_processing: PreProcessingConfig | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    realtime_processing: RealtimeProcessingConfig | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    messages_config: MessagesConfig | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_vad: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
 class GladiaSTTService(WebsocketSTTService):
     """Speech-to-Text service using Gladia's API.
 
@@ -191,6 +230,8 @@ class GladiaSTTService(WebsocketSTTService):
         Use :class:`~pipecat.services.gladia.config.GladiaInputParams` directly instead.
     """
 
+    _settings: GladiaSTTSettings
+
     # Maintain backward compatibility
     InputParams = _InputParamsDescriptor()
 
@@ -200,12 +241,16 @@ class GladiaSTTService(WebsocketSTTService):
         api_key: str,
         region: Literal["us-west", "eu-west"] | None = None,
         url: str = "https://api.gladia.io/v2/live",
+        encoding: str = "wav/pcm",
+        bit_depth: int = 16,
+        channels: int = 1,
         confidence: Optional[float] = None,
         sample_rate: Optional[int] = None,
-        model: str = "solaria-1",
+        model: Optional[str] = None,
         params: Optional[GladiaInputParams] = None,
         max_buffer_size: int = 1024 * 1024 * 20,  # 20MB default buffer
         should_interrupt: bool = True,
+        settings: Optional[GladiaSTTSettings] = None,
         ttfs_p99_latency: Optional[float] = GLADIA_TTFS_P99,
         **kwargs,
     ):
@@ -215,6 +260,9 @@ class GladiaSTTService(WebsocketSTTService):
             api_key: Gladia API key for authentication.
             region: Region used to process audio. eu-west or us-west. Defaults to eu-west.
             url: Gladia API URL. Defaults to "https://api.gladia.io/v2/live".
+            encoding: Audio encoding format. Defaults to ``"wav/pcm"``.
+            bit_depth: Audio bit depth. Defaults to 16.
+            channels: Number of audio channels. Defaults to 1.
             confidence: Minimum confidence threshold for transcriptions (0.0-1.0).
 
                 .. deprecated:: 0.0.86
@@ -222,29 +270,26 @@ class GladiaSTTService(WebsocketSTTService):
                     No confidence threshold is applied.
 
             sample_rate: Audio sample rate in Hz. If None, uses service default.
-            model: Model to use for transcription. Defaults to "solaria-1".
+            model: Model to use for transcription.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=GladiaSTTSettings(model=...)`` instead.
+
             params: Additional configuration parameters for Gladia service.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=GladiaSTTSettings(...)`` for runtime-updatable
+                    fields and direct init parameters for encoding/bit_depth/channels.
+
             max_buffer_size: Maximum size of audio buffer in bytes. Defaults to 20MB.
             should_interrupt: Determine whether the bot should be interrupted when
                 Gladia VAD detects user speech. Defaults to True.
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
                 Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to the STTService parent class.
         """
-        super().__init__(sample_rate=sample_rate, ttfs_p99_latency=ttfs_p99_latency, **kwargs)
-
-        params = params or GladiaInputParams()
-
-        if params.language is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.warn(
-                    "The 'language' parameter is deprecated and will be removed in a future version. "
-                    "Use 'language_config' instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
         if confidence:
             with warnings.catch_warnings():
                 warnings.simplefilter("always")
@@ -255,14 +300,86 @@ class GladiaSTTService(WebsocketSTTService):
                     stacklevel=2,
                 )
 
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = GladiaSTTSettings(
+            model="solaria-1",
+            language=None,
+            language_config=None,
+            custom_metadata=None,
+            endpointing=None,
+            maximum_duration_without_endpointing=5,
+            pre_processing=None,
+            realtime_processing=None,
+            messages_config=None,
+            enable_vad=False,
+        )
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            _warn_deprecated_param("model", GladiaSTTSettings, "model")
+            default_settings.model = model
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            _warn_deprecated_param("params", GladiaSTTSettings)
+            if params.language is not None:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("always")
+                    warnings.warn(
+                        "The 'language' parameter is deprecated and will be removed in a future "
+                        "version. Use 'language_config' instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+            if not settings:
+                # Extract init-only fields from params
+                if params.encoding is not None:
+                    encoding = params.encoding
+                if params.bit_depth is not None:
+                    bit_depth = params.bit_depth
+                if params.channels is not None:
+                    channels = params.channels
+                default_settings.custom_metadata = params.custom_metadata
+                default_settings.endpointing = params.endpointing
+                default_settings.maximum_duration_without_endpointing = (
+                    params.maximum_duration_without_endpointing
+                )
+                default_settings.pre_processing = params.pre_processing
+                default_settings.realtime_processing = params.realtime_processing
+                default_settings.messages_config = params.messages_config
+                default_settings.enable_vad = params.enable_vad
+                # Resolve deprecated language → language_config at init time
+                if params.language_config:
+                    default_settings.language_config = params.language_config
+                elif params.language:
+                    language_code = self.language_to_service_language(params.language)
+                    if language_code:
+                        default_settings.language_config = LanguageConfig(
+                            languages=[language_code], code_switching=False
+                        )
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=20,
+            keepalive_interval=5,
+            settings=default_settings,
+            **kwargs,
+        )
+
         self._api_key = api_key
         self._region = region
         self._url = url
-        self.set_model_name(model)
-        self._params = params
         self._receive_task = None
-        self._keepalive_task = None
-        self._settings = {}
+
+        # Init-only connection config
+        self._encoding = encoding
+        self._bit_depth = bit_depth
+        self._channels = channels
 
         # Session management
         self._session_url = None
@@ -301,54 +418,44 @@ class GladiaSTTService(WebsocketSTTService):
         """
         return language_to_gladia_language(language)
 
-    def _prepare_settings(self) -> Dict[str, Any]:
+    def _prepare_settings(self) -> dict[str, Any]:
+        s = self._settings
+
         settings = {
-            "encoding": self._params.encoding or "wav/pcm",
-            "bit_depth": self._params.bit_depth or 16,
+            "encoding": self._encoding or "wav/pcm",
+            "bit_depth": self._bit_depth or 16,
             "sample_rate": self.sample_rate,
-            "channels": self._params.channels or 1,
-            "model": self._model_name,
+            "channels": self._channels or 1,
+            "model": s.model,
         }
 
         # Add custom_metadata if provided
-        settings["custom_metadata"] = dict(self._params.custom_metadata or {})
+        settings["custom_metadata"] = dict(s.custom_metadata or {})
         settings["custom_metadata"]["pipecat"] = pipecat_version()
 
         # Add endpointing parameters if provided
-        if self._params.endpointing is not None:
-            settings["endpointing"] = self._params.endpointing
-        if self._params.maximum_duration_without_endpointing is not None:
+        if s.endpointing is not None:
+            settings["endpointing"] = s.endpointing
+        if s.maximum_duration_without_endpointing is not None:
             settings["maximum_duration_without_endpointing"] = (
-                self._params.maximum_duration_without_endpointing
+                s.maximum_duration_without_endpointing
             )
 
-        # Add language configuration (prioritize language_config over deprecated language)
-        if self._params.language_config:
-            settings["language_config"] = self._params.language_config.model_dump(exclude_none=True)
-        elif self._params.language:  # Backward compatibility for deprecated parameter
-            language_code = self.language_to_service_language(self._params.language)
-            if language_code:
-                settings["language_config"] = {
-                    "languages": [language_code],
-                    "code_switching": False,
-                }
+        # Add language configuration
+        if s.language_config:
+            settings["language_config"] = s.language_config.model_dump(exclude_none=True)
 
         # Add pre_processing configuration if provided
-        if self._params.pre_processing:
-            settings["pre_processing"] = self._params.pre_processing.model_dump(exclude_none=True)
+        if s.pre_processing:
+            settings["pre_processing"] = s.pre_processing.model_dump(exclude_none=True)
 
         # Add realtime_processing configuration if provided
-        if self._params.realtime_processing:
-            settings["realtime_processing"] = self._params.realtime_processing.model_dump(
-                exclude_none=True
-            )
+        if s.realtime_processing:
+            settings["realtime_processing"] = s.realtime_processing.model_dump(exclude_none=True)
 
         # Add messages_config if provided
-        if self._params.messages_config:
-            settings["messages_config"] = self._params.messages_config.model_dump(exclude_none=True)
-
-        # Store settings for tracing
-        self._settings = settings
+        if s.messages_config:
+            settings["messages_config"] = s.messages_config.model_dump(exclude_none=True)
 
         return settings
 
@@ -360,6 +467,33 @@ class GladiaSTTService(WebsocketSTTService):
         """
         await super().start(frame)
         await self._connect()
+
+    async def _update_settings(self, delta: GladiaSTTSettings) -> dict[str, Any]:
+        """Apply settings delta.
+
+        Settings are stored but not applied to the active session.
+
+        Args:
+            delta: A settings delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+
+        if not changed:
+            return changed
+
+        # TODO: someday we could reconnect here to apply updated settings.
+        # Code might look something like the below:
+        # self._session_url = None
+        # self._session_id = None
+        # await self._disconnect()
+        # await self._connect()
+
+        self._warn_unhandled_updated_settings(changed)
+
+        return changed
 
     async def stop(self, frame: EndFrame):
         """Stop the Gladia STT websocket connection.
@@ -416,8 +550,6 @@ class GladiaSTTService(WebsocketSTTService):
 
         Initializes the session if needed and establishes websocket connection.
         """
-        await super()._connect()
-
         # Initialize session if needed
         if not self._session_url:
             settings = self._prepare_settings()
@@ -428,11 +560,10 @@ class GladiaSTTService(WebsocketSTTService):
 
         await self._connect_websocket()
 
+        await super()._connect()
+
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
-
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
         """Disconnect from the Gladia service.
@@ -442,10 +573,6 @@ class GladiaSTTService(WebsocketSTTService):
         await super()._disconnect()
 
         self._connection_active = False
-
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -490,7 +617,7 @@ class GladiaSTTService(WebsocketSTTService):
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
-    async def _setup_gladia(self, settings: Dict[str, Any]):
+    async def _setup_gladia(self, settings: dict[str, Any]):
         async with aiohttp.ClientSession() as session:
             params = {}
             if self._region:
@@ -524,7 +651,7 @@ class GladiaSTTService(WebsocketSTTService):
         Broadcasts UserStartedSpeakingFrame and optionally triggers interruption
         when VAD is enabled.
         """
-        if not self._params.enable_vad or self._is_speaking:
+        if not self._settings.enable_vad or self._is_speaking:
             return
 
         logger.debug(f"{self} User started speaking")
@@ -532,14 +659,14 @@ class GladiaSTTService(WebsocketSTTService):
 
         await self.broadcast_frame(UserStartedSpeakingFrame)
         if self._should_interrupt:
-            await self.push_interruption_task_frame_and_wait()
+            await self.broadcast_interruption()
 
     async def _on_speech_ended(self):
         """Handle speech end event from Gladia.
 
         Broadcasts UserStoppedSpeakingFrame when VAD is enabled.
         """
-        if not self._params.enable_vad or not self._is_speaking:
+        if not self._settings.enable_vad or not self._is_speaking:
             return
         self._is_speaking = False
         await self.broadcast_frame(UserStoppedSpeakingFrame)
@@ -644,21 +771,10 @@ class GladiaSTTService(WebsocketSTTService):
             except json.JSONDecodeError:
                 logger.warning(f"{self} Received non-JSON message: {message}")
 
-    async def _keepalive_task_handler(self):
-        """Send periodic empty audio chunks to keep the connection alive."""
-        try:
-            KEEPALIVE_SLEEP = 20
-            while self._connection_active:
-                # Send keepalive (Gladia times out after 30 seconds)
-                await asyncio.sleep(KEEPALIVE_SLEEP)
-                if self._websocket and self._websocket.state is State.OPEN:
-                    # Send an empty audio chunk as keepalive
-                    empty_audio = b""
-                    await self._send_audio(empty_audio)
-                else:
-                    logger.debug(f"{self} Websocket closed, stopping keepalive")
-                    break
-        except websockets.exceptions.ConnectionClosed:
-            logger.debug(f"{self} Connection closed during keepalive")
-        except Exception as e:
-            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+    async def _send_keepalive(self, silence: bytes):
+        """Send an empty audio chunk to keep the Gladia connection alive.
+
+        Args:
+            silence: Silent PCM audio bytes (unused, Gladia accepts empty chunks).
+        """
+        await self._send_audio(b"")

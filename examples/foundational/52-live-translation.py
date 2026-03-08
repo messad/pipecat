@@ -10,8 +10,8 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -22,14 +22,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
@@ -60,19 +59,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="d4db5fb9-f44b-4bd1-85fa-192e0f0d75f9",  # Spanish-speaking Lady
+        settings=CartesiaTTSSettings(
+            voice="d4db5fb9-f44b-4bd1-85fa-192e0f0d75f9",  # Spanish-speaking Lady
+        ),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMSettings(
+            system_instruction="You are a live translation assistant. Your sole purpose is to translate English text into Spanish. When you receive English text from the user, immediately translate it into natural, fluent Spanish. Do not add explanations, commentary, or extra information—only provide the Spanish translation of the text you receive.",
+        ),
+    )
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a live translation assistant. Your sole purpose is to translate English text into Spanish. When you receive English text from the user, immediately translate it into natural, fluent Spanish. Do not add explanations, commentary, or extra information—only provide the Spanish translation of the text you receive.",
-        },
-    ]
-
-    context = LLMContext(messages)
+    context = LLMContext()
 
     # We use the TranscriptionUserTurnStartStrategy to start a new user turn
     # every time a transcription is received. We disable interruptions, so the
@@ -83,7 +82,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
                 start=[TranscriptionUserTurnStartStrategy(enable_interruptions=False)],
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())],
             ),
             vad_analyzer=SileroVADAnalyzer(),
         ),
@@ -113,6 +111,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
+        await task.queue_frames(
+            [
+                TTSSpeakFrame(
+                    text="Hello, welcome to live translation. Everything you say will be automatically translated to Spanish. Let's begin!",
+                    append_to_context=True,
+                ),
+            ]
+        )
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

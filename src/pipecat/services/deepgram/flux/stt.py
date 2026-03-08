@@ -9,6 +9,7 @@
 import asyncio
 import json
 import time
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, Optional
 from urllib.parse import urlencode
@@ -27,6 +28,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, _warn_deprecated_param
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -67,19 +69,57 @@ class FluxEventType(str, Enum):
     UPDATE = "Update"
 
 
+@dataclass
+class DeepgramFluxSTTSettings(STTSettings):
+    """Settings for DeepgramFluxSTTService.
+
+    Parameters:
+        eager_eot_threshold: EagerEndOfTurn/TurnResumed threshold. Off by default.
+            Lower values = more aggressive (faster response, more LLM calls).
+            Higher values = more conservative (slower response, fewer LLM calls).
+        eot_threshold: End-of-turn confidence required to finish a turn (default 0.7).
+        eot_timeout_ms: Time in ms after speech to finish a turn regardless of EOT
+            confidence (default 5000).
+        keyterm: Keyterms to boost recognition accuracy for specialized terminology.
+        min_confidence: Minimum confidence required to create a TranscriptionFrame.
+    """
+
+    eager_eot_threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    eot_threshold: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    eot_timeout_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    keyterm: list | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    min_confidence: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
 class DeepgramFluxSTTService(WebsocketSTTService):
     """Deepgram Flux speech-to-text service.
 
     Provides real-time speech recognition using Deepgram's WebSocket API with Flux capabilities.
     Supports configurable models, VAD events, and various audio processing options
     including advanced turn detection and EagerEndOfTurn events for improved conversational AI performance.
+
+    Event handlers available (in addition to WebsocketSTTService events):
+
+    - on_speech_started(service): Deepgram detected start of speech
+    - on_utterance_end(service): Deepgram detected end of utterance
+    - on_end_of_turn(service): Deepgram detected end of turn (EOT)
+    - on_eager_end_of_turn(service): Deepgram predicted end of turn (EagerEOT)
+    - on_turn_resumed(service): User resumed speaking after EagerEOT
+
+    Example::
+
+        @stt.event_handler("on_end_of_turn")
+        async def on_end_of_turn(service):
+            ...
     """
+
+    _settings: DeepgramFluxSTTSettings
 
     class InputParams(BaseModel):
         """Configuration parameters for Deepgram Flux API.
 
-        This class defines all available connection parameters for the Deepgram Flux API
-        based on the official documentation.
+        .. deprecated:: 0.0.105
+            Use ``settings=DeepgramFluxSTTSettings(...)`` instead.
 
         Parameters:
             eager_eot_threshold: Optional. EagerEndOfTurn/TurnResumed are off by default.
@@ -112,10 +152,13 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         api_key: str,
         url: str = "wss://api.deepgram.com/v2/listen",
         sample_rate: Optional[int] = None,
-        model: str = "flux-general-en",
+        mip_opt_out: Optional[bool] = None,
+        model: Optional[str] = None,
         flux_encoding: str = "linear16",
+        tag: Optional[list] = None,
         params: Optional[InputParams] = None,
         should_interrupt: bool = True,
+        settings: Optional[DeepgramFluxSTTSettings] = None,
         **kwargs,
     ):
         """Initialize the Deepgram Flux STT service.
@@ -123,13 +166,25 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         Args:
             api_key: Deepgram API key for authentication. Required for API access.
             url: WebSocket URL for the Deepgram Flux API. Defaults to the preview endpoint.
-            sample_rate: Audio sample rate in Hz. If None, uses the rate from params or 16000.
-            model: Deepgram Flux model to use for transcription. Currently only supports "flux-general-en".
+            sample_rate: Audio sample rate in Hz. If None, uses the pipeline
+                sample rate.
+            mip_opt_out: Opt out of the Deepgram Model Improvement Program.
+            model: Deepgram Flux model to use for transcription.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=DeepgramFluxSTTSettings(model=...)`` instead.
+
             flux_encoding: Audio encoding format required by Flux API. Must be "linear16".
                 Raw signed little-endian 16-bit PCM encoding.
+            tag: Tags to label requests for identification during usage reporting.
             params: InputParams instance containing detailed API configuration options.
-                If None, default parameters will be used.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=DeepgramFluxSTTSettings(...)`` instead.
+
             should_interrupt: Determine whether the bot should be interrupted when Flux detects that the user is speaking.
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional arguments passed to the parent WebsocketSTTService class.
 
         Examples:
@@ -139,16 +194,15 @@ class DeepgramFluxSTTService(WebsocketSTTService):
 
             Advanced usage with custom parameters::
 
-                params = DeepgramFluxSTTService.InputParams(
-                    eager_eot_threshold=0.5,
-                    eot_threshold=0.8,
-                    keyterm=["AI", "machine learning", "neural network"],
-                    tag=["production", "voice-agent"]
-                )
                 stt = DeepgramFluxSTTService(
                     api_key="your-api-key",
-                    model="flux-general-en",
-                    params=params
+                    settings=DeepgramFluxSTTSettings(
+                        model="flux-general-en",
+                        eager_eot_threshold=0.5,
+                        eot_threshold=0.8,
+                        keyterm=["AI", "machine learning", "neural network"],
+                        tag=["production", "voice-agent"],
+                    ),
                 )
         """
         # Note: For DeepgramFluxSTTService, differently from other processes, we need to create
@@ -161,22 +215,56 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         # was never destroyed.
         # So we can keep it here as false, because inside the method send_with_retry, it will
         # already try to reconnect if needed.
+
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = DeepgramFluxSTTSettings(
+            model="flux-general-en",
+            language=Language.EN,
+            eager_eot_threshold=None,
+            eot_threshold=None,
+            eot_timeout_ms=None,
+            keyterm=[],
+            min_confidence=None,
+        )
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            _warn_deprecated_param("model", DeepgramFluxSTTSettings, "model")
+            default_settings.model = model
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            _warn_deprecated_param("params", DeepgramFluxSTTSettings)
+            if not settings:
+                default_settings.eager_eot_threshold = params.eager_eot_threshold
+                default_settings.eot_threshold = params.eot_threshold
+                default_settings.eot_timeout_ms = params.eot_timeout_ms
+                default_settings.keyterm = params.keyterm or []
+                if params.tag and tag is None:
+                    tag = params.tag
+                default_settings.min_confidence = params.min_confidence
+                if params.mip_opt_out is not None:
+                    mip_opt_out = params.mip_opt_out
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
         super().__init__(
             sample_rate=sample_rate,
             reconnect_on_error=False,
+            settings=default_settings,
             **kwargs,
         )
-
         self._api_key = api_key
         self._url = url
-        self._model = model
-        self._params = params or DeepgramFluxSTTService.InputParams()
         self._should_interrupt = should_interrupt
-        self._flux_encoding = flux_encoding
-        # This is the currently only supported language
-        self._language = Language.EN
+        self._encoding = flux_encoding
+        self._mip_opt_out = mip_opt_out
+        self._tag = tag or []
         self._websocket_url = None
         self._receive_task = None
+
         # Flux event handlers
         self._register_event_handler("on_start_of_turn")
         self._register_event_handler("on_turn_resumed")
@@ -329,6 +417,25 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         """
         return True
 
+    async def _update_settings(self, delta: DeepgramFluxSTTSettings) -> dict[str, Any]:
+        """Apply a settings delta.
+
+        Settings are stored but not applied to the active connection.
+        """
+        changed = await super()._update_settings(delta)
+
+        if not changed:
+            return changed
+
+        # TODO: someday we could reconnect here to apply updated settings.
+        # Code might look something like the below:
+        # await self._disconnect()
+        # await self._connect()
+
+        self._warn_unhandled_updated_settings(changed)
+
+        return changed
+
     async def start(self, frame: StartFrame):
         """Start the Deepgram Flux STT service.
 
@@ -341,29 +448,29 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         await super().start(frame)
 
         url_params = [
-            f"model={self._model}",
+            f"model={self._settings.model}",
             f"sample_rate={self.sample_rate}",
-            f"encoding={self._flux_encoding}",
+            f"encoding={self._encoding}",
         ]
 
-        if self._params.eager_eot_threshold is not None:
-            url_params.append(f"eager_eot_threshold={self._params.eager_eot_threshold}")
+        if self._settings.eager_eot_threshold is not None:
+            url_params.append(f"eager_eot_threshold={self._settings.eager_eot_threshold}")
 
-        if self._params.eot_threshold is not None:
-            url_params.append(f"eot_threshold={self._params.eot_threshold}")
+        if self._settings.eot_threshold is not None:
+            url_params.append(f"eot_threshold={self._settings.eot_threshold}")
 
-        if self._params.eot_timeout_ms is not None:
-            url_params.append(f"eot_timeout_ms={self._params.eot_timeout_ms}")
+        if self._settings.eot_timeout_ms is not None:
+            url_params.append(f"eot_timeout_ms={self._settings.eot_timeout_ms}")
 
-        if self._params.mip_opt_out is not None:
-            url_params.append(f"mip_opt_out={str(self._params.mip_opt_out).lower()}")
+        if self._mip_opt_out is not None:
+            url_params.append(f"mip_opt_out={str(self._mip_opt_out).lower()}")
 
         # Add keyterm parameters (can have multiple)
-        for keyterm in self._params.keyterm:
+        for keyterm in self._settings.keyterm:
             url_params.append(urlencode({"keyterm": keyterm}))
 
         # Add tag parameters (can have multiple)
-        for tag_value in self._params.tag:
+        for tag_value in self._tag:
             url_params.append(urlencode({"tag": tag_value}))
 
         self._websocket_url = f"{self._url}?{'&'.join(url_params)}"
@@ -603,7 +710,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         self._user_is_speaking = True
         await self.broadcast_frame(UserStartedSpeakingFrame)
         if self._should_interrupt:
-            await self.push_interruption_task_frame_and_wait()
+            await self.broadcast_interruption()
         await self.start_metrics()
         await self._call_event_handler("on_start_of_turn", transcript)
         if transcript:
@@ -662,7 +769,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         # Compute the average confidence
         average_confidence = self._calculate_average_confidence(data)
 
-        if not self._params.min_confidence or average_confidence > self._params.min_confidence:
+        if not self._settings.min_confidence or average_confidence > self._settings.min_confidence:
             # EndOfTurn means Flux has determined the turn is complete,
             # so this TranscriptionFrame is always finalized
             await self.push_frame(
@@ -670,7 +777,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
                     transcript,
                     self._user_id,
                     time_now_iso8601(),
-                    self._language,
+                    self._settings.language,
                     result=data,
                     finalized=True,
                 )
@@ -680,7 +787,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
                 f"Transcription confidence below min_confidence threshold: {average_confidence}"
             )
 
-        await self._handle_transcription(transcript, True, self._language)
+        await self._handle_transcription(transcript, True, self._settings.language)
         await self.stop_processing_metrics()
         await self.broadcast_frame(UserStoppedSpeakingFrame)
         await self._call_event_handler("on_end_of_turn", transcript)
@@ -724,7 +831,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
                 transcript,
                 self._user_id,
                 time_now_iso8601(),
-                self._language,
+                self._settings.language,
                 result=data,
             )
         )

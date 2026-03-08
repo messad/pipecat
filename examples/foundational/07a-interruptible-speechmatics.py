@@ -10,7 +10,6 @@ import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -23,16 +22,14 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.openai.base_llm import BaseOpenAILLMService
+from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.speechmatics.stt import SpeechmaticsSTTService
-from pipecat.services.speechmatics.tts import SpeechmaticsTTSService
+from pipecat.services.speechmatics.stt import SpeechmaticsSTTService, SpeechmaticsSTTSettings
+from pipecat.services.speechmatics.tts import SpeechmaticsTTSService, SpeechmaticsTTSSettings
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -79,7 +76,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async with aiohttp.ClientSession() as session:
         stt = SpeechmaticsSTTService(
             api_key=os.getenv("SPEECHMATICS_API_KEY"),
-            params=SpeechmaticsSTTService.InputParams(
+            settings=SpeechmaticsSTTSettings(
                 language=Language.EN,
                 speaker_active_format="<{speaker_id}>{text}</{speaker_id}>",
             ),
@@ -87,41 +84,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
         tts = SpeechmaticsTTSService(
             api_key=os.getenv("SPEECHMATICS_API_KEY"),
-            voice_id="sarah",
+            settings=SpeechmaticsTTSSettings(
+                voice="sarah",
+            ),
             aiohttp_session=session,
         )
 
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            params=BaseOpenAILLMService.InputParams(temperature=0.75),
+            settings=OpenAILLMSettings(
+                temperature=0.75,
+                system_instruction="You are a helpful British assistant called Sarah. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Always include punctuation in your responses. Give very short replies - do not give longer replies unless strictly necessary. Respond to what the user said in a concise, funny, creative and helpful way. Use `<Sn/>` tags to identify different speakers - do not use tags in your replies. Do not respond to speakers within `<PASSIVE/>` tags unless explicitly asked to.",
+            ),
         )
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful British assistant called Sarah. "
-                    "Your goal is to demonstrate your capabilities in a succinct way. "
-                    "Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. "
-                    "Always include punctuation in your responses. "
-                    "Give very short replies - do not give longer replies unless strictly necessary. "
-                    "Respond to what the user said in a concise, funny, creative and helpful way. "
-                    "Use `<Sn/>` tags to identify different speakers - do not use tags in your replies."
-                ),
-            },
-        ]
-
-        context = LLMContext(messages)
+        context = LLMContext()
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
-            user_params=LLMUserAggregatorParams(
-                user_turn_strategies=UserTurnStrategies(
-                    stop=[
-                        TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())
-                    ]
-                ),
-                vad_analyzer=SileroVADAnalyzer(),
-            ),
+            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
         )
 
         pipeline = Pipeline(
@@ -149,7 +129,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         async def on_client_connected(transport, client):
             logger.info(f"Client connected")
             # Kick off the conversation.
-            messages.append({"role": "system", "content": "Say a short hello to the user."})
+            context.add_message({"role": "user", "content": "Say a short hello to the user."})
             await task.queue_frames([LLMRunFrame()])
 
         @transport.event_handler("on_client_disconnected")
