@@ -5,7 +5,6 @@ import asyncio
 import logging
 import base64
 import json
-import re
 from typing import Dict, Any, Optional
 from deepgram import LiveOptions
 
@@ -28,7 +27,7 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.groq import GroqLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -67,6 +66,15 @@ FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://pipecatcon:8000")
 
+# Türkçe dolgu kelimeleri — LLM cevap üretirken araya girer, gecikmeyi maskeler
+TR_FILLER_PHRASES = [
+    "Hmm...",
+    "Tabii,",
+    "Anladım,",
+    "Hemen bakıyorum,",
+    "Bir saniye,",
+]
+
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -82,6 +90,7 @@ class OutboundCallRequest(BaseModel):
     llm_model: Optional[str] = "llama-3.3-70b-versatile"
 
     tts_provider: Optional[str] = "cartesia"
+    tts_model: Optional[str] = "sonic-multilingual"   # ← postmandan gönderilebilir
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
 
 
@@ -119,9 +128,9 @@ def service_factory(config: dict):
                 encoding="linear16",
                 sample_rate=stt_sample_rate,
                 channels=1,
-                interim_results=False,
+                interim_results=True,   # Deepgram docs'ta önerilen: açık kalsın
                 punctuate=True,
-                smart_format=True,
+                smart_format=True,      # Türkçe akıllı formatlama
                 profanity_filter=False,
             )
         )
@@ -134,8 +143,8 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.5,
-            start_secs=0.3,
+            stop_secs=0.75,             # Türkçe sondan eklemeli yapı için ideal
+            start_secs=0.4,             # min_speech_duration karşılığı
             min_volume=0.6,
             confidence=0.75
         )
@@ -174,10 +183,12 @@ def service_factory(config: dict):
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
             sample_rate=8000,
-            model="sonic-multilingual",
+            model=config.get("tts_model", "sonic-multilingual"),  # ← postmandan gelir
             language=Language.TR,
-            speed=1.0,
+            speed=0.9,
             emotion="friendly",
+			# text_aggregation_mode=TextAggregationMode.SENTENCE  # default, gerek yok
+            # text_aggregation_mode=TextAggregationMode.TOKEN     # düşük latency istersen
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -191,91 +202,37 @@ def service_factory(config: dict):
 
 
 # ---------------------------------------------------------------------------
-# TÜRKÇE OPTİMİZE SENTENCE BUFFER
+# DOLGU KELİMELERİ PROCESSOR
+# LLM cevap üretmeye başlar başlamaz ilk token gelmeden önce kısa bir
+# dolgu cümlesi TTS'e gönderilir. Gecikme hissini maskeler.
 # ---------------------------------------------------------------------------
-class SentenceBuffer(FrameProcessor):
-    TR_ABBREVIATIONS = {
-        "dr", "prof", "doç", "öğr", "müh", "yrd", "uzm", "arş",
-        "sok", "cad", "apt", "blv", "no", "tel", "faks", "www",
-        "kg", "km", "cm", "mm", "lt", "ml", "vs", "vb", "bkz",
-        "mrk", "ünv", "a.ş", "ltd", "şti",
-    }
-
-    HARD_END = re.compile(r'[.!?…]+')
-
-    TR_CONNECTOR_PAUSE = re.compile(
-        r',\s*(ancak|fakat|lakin|ama|oysa|halbuki|bunun\s+için|bu\s+nedenle|'
-        r'bu\s+yüzden|dolayısıyla|sonuç\s+olarak|öte\s+yandan|'
-        r'bir\s+taraftan|diğer\s+taraftan|ayrıca|dahası|üstelik|'
-        r'buna\s+ek\s+olarak|bunun\s+yanında|örneğin|mesela|'
-        r'yani|kısacası|özetle|sonuçta)\s',
-        re.IGNORECASE
-    )
-
-    def __init__(self, min_chars: int = 8):
+class FillerWordInjector(FrameProcessor):
+    def __init__(self, tts_input_queue_frame_pusher, phrases: list):
         super().__init__()
-        self.buffer = ""
-        self.min_chars = min_chars
+        self.phrases = phrases
+        self._phrase_index = 0
+        self._injected = False
 
-    def _is_abbreviation(self, text: str, dot_pos: int) -> bool:
-        before = text[:dot_pos].rstrip()
-        word = before.split()[-1].lower() if before.split() else ""
-        if word.isdigit():
-            return True
-        if len(word) == 1:
-            return True
-        if word.rstrip('.') in self.TR_ABBREVIATIONS:
-            return True
-        return False
-
-    def _find_sentence_boundary(self, text: str) -> int:
-        for match in self.HARD_END.finditer(text):
-            pos = match.end()
-            if match.group().startswith('.') and self._is_abbreviation(text, match.start()):
-                continue
-            if pos >= len(text) or text[pos] in (' ', '\n', '\t'):
-                return pos
-            if pos == len(text):
-                return pos
-
-        connector_match = self.TR_CONNECTOR_PAUSE.search(text)
-        if connector_match and connector_match.start() > self.min_chars:
-            return connector_match.start() + 1
-
-        if len(text) >= 40:
-            last_comma = text.rfind(',')
-            if last_comma > self.min_chars:
-                return last_comma + 1
-
-        return -1
-
-    async def _flush(self, text: str):
-        text = text.strip()
-        if len(text) >= self.min_chars:
-            logger.debug(f"📝 [SentenceBuffer → TTS]: '{text}'")
-            await self.push_frame(TextFrame(text=text))
+    def _next_phrase(self) -> str:
+        phrase = self.phrases[self._phrase_index % len(self.phrases)]
+        self._phrase_index += 1
+        return phrase
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TextFrame):
-            self.buffer += frame.text
-            while True:
-                boundary = self._find_sentence_boundary(self.buffer)
-                if boundary == -1:
-                    break
-                sentence = self.buffer[:boundary]
-                self.buffer = self.buffer[boundary:].lstrip()
-                await self._flush(sentence)
+        # LLM yeni bir tur başlattığında dolgu kelimesini enjekte et
+        if isinstance(frame, LLMMessagesUpdateFrame):
+            self._injected = False
 
-        elif isinstance(frame, (EndFrame, LLMMessagesUpdateFrame)):
-            if self.buffer.strip():
-                await self._flush(self.buffer)
-                self.buffer = ""
-            await self.push_frame(frame, direction)
+        if isinstance(frame, TextFrame) and not self._injected:
+            self._injected = True
+            filler = self._next_phrase()
+            logger.debug(f"💬 [Dolgu]: '{filler}'")
+            # Dolgu kelimesini önce gönder, ardından asıl frame'i geç
+            await self.push_frame(TextFrame(text=filler), direction)
 
-        else:
-            await self.push_frame(frame, direction)
+        await self.push_frame(frame, direction)
 
 
 # --- SHARED STATE ---
@@ -284,7 +241,7 @@ class BotSpeakingState:
         self.is_speaking = False
 
 
-# --- UPSTREAM SUPPRESSOR ---
+# --- UPSTREAM SUPPRESSOR (AEC) ---
 class SoftwareEchoSuppressor(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
@@ -431,7 +388,7 @@ async def websocket_endpoint(websocket: WebSocket):
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
-    sentence_buffer = SentenceBuffer(min_chars=8)
+    filler_injector = FillerWordInjector(None, TR_FILLER_PHRASES)
 
     pipeline = Pipeline([
         fs_input,
@@ -441,8 +398,8 @@ async def websocket_endpoint(websocket: WebSocket):
         context_aggregator_pair.user(),
         llm,
         llm_logger,
-        sentence_buffer,        # LLM tokenlarını biriktir, cümle tamamlanınca TTS'e gönder
-        tts,
+        filler_injector,    # LLM'in ilk tokeni gelince dolgu kelimesi TTS'e gider
+        tts,                # Cartesia SENTENCE modunda çalışıyor, ayrıca buffer gerekmez
         bot_tracker,
         fs_output,
         context_aggregator_pair.assistant()
@@ -451,25 +408,14 @@ async def websocket_endpoint(websocket: WebSocket):
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
 
-    initial_message = LLMMessagesUpdateFrame(
-        messages=[{
-            "role": "user",
-            "content": "Telefon bağlandı. Kısa, enerjik ve kibar bir şekilde Türkçe 'Merhaba, size nasıl yardımcı olabilirim?' de."
-        }],
-        run_llm=True
-    )
+    # Cold start kaldırıldı — system_prompt yeterli, ajan kullanıcıyı bekler
 
     async def run_pipeline():
         await runner.run(task)
 
-    async def send_initial():
-        await asyncio.sleep(0.5)
-        logger.info("Cold Start mesajı gönderiliyor...")
-        await task.queue_frame(initial_message)
-
     logger.info("Pipeline başlatılıyor...")
     try:
-        await asyncio.gather(run_pipeline(), send_initial())
+        await run_pipeline()
     except Exception as e:
         logger.error(f"Pipeline hatası: {e}")
     finally:
