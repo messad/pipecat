@@ -233,7 +233,7 @@ class FillerWordInjector(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, UserStoppedSpeakingFrame):
+        if isinstance(frame, TranscriptionFrame):
             filler = self._next_phrase()
             logger.debug(f"💬 [Dolgu]: '{filler}'")
             await self.push_frame(TextFrame(text=filler), direction)
@@ -252,7 +252,7 @@ class SoftwareEchoSuppressor(FrameProcessor):
         super().__init__()
         self.state = state
         self._consecutive_speech_frames = 0
-        self._barge_in_threshold = 15  # ~600ms @ 8000Hz/320byte chunks
+        self._barge_in_threshold = 5  # ~600ms @ 8000Hz/320byte chunks
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -397,6 +397,12 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"Config bulundu. call_id={call_id}")
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
+
+    try:
+	    await tts.start(StartFrame())
+		logger.info("🔥 TTS warm-up tamamlandı.")
+	except Exception as e:
+	    logger.warning(f"TTS warm-up başarısız (önemli değil): {e}")
 
     bot_state = BotSpeakingState()
     echo_suppressor = SoftwareEchoSuppressor(bot_state)
