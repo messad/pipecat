@@ -5,6 +5,7 @@ import asyncio
 import logging
 import base64
 import json
+import re
 from typing import Dict, Any, Optional
 from deepgram import LiveOptions
 
@@ -78,7 +79,7 @@ class OutboundCallRequest(BaseModel):
     stt_sample_rate: Optional[int] = 8000
 
     llm_provider: Optional[str] = "groq"
-    llm_model: Optional[str] = "llama-3.1-8b-instant"
+    llm_model: Optional[str] = "llama-3.3-70b-versatile"
 
     tts_provider: Optional[str] = "cartesia"
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
@@ -118,9 +119,9 @@ def service_factory(config: dict):
                 encoding="linear16",
                 sample_rate=stt_sample_rate,
                 channels=1,
-                interim_results=True,
+                interim_results=False,
                 punctuate=True,
-                smart_format=False,
+                smart_format=True,
                 profanity_filter=False,
             )
         )
@@ -162,7 +163,7 @@ def service_factory(config: dict):
     elif llm_provider == "groq":
         llm = GroqLLMService(
             api_key=os.getenv("GROQ_API_KEY"),
-            model=config.get("llm_model", "llama-3.1-8b-instant")
+            model=config.get("llm_model", "llama-3.3-70b-versatile")
         )
     else:
         raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
@@ -176,7 +177,7 @@ def service_factory(config: dict):
             model="sonic-multilingual",
             language=Language.TR,
             speed=1.0,
-            emotion="neutral",  # FIX: list değil string
+            emotion="friendly",
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -187,6 +188,94 @@ def service_factory(config: dict):
         raise ValueError(f"Desteklenmeyen TTS provider: {tts_provider}")
 
     return stt, llm, tts, context_aggregator_pair
+
+
+# ---------------------------------------------------------------------------
+# TÜRKÇE OPTİMİZE SENTENCE BUFFER
+# ---------------------------------------------------------------------------
+class SentenceBuffer(FrameProcessor):
+    TR_ABBREVIATIONS = {
+        "dr", "prof", "doç", "öğr", "müh", "yrd", "uzm", "arş",
+        "sok", "cad", "apt", "blv", "no", "tel", "faks", "www",
+        "kg", "km", "cm", "mm", "lt", "ml", "vs", "vb", "bkz",
+        "mrk", "ünv", "a.ş", "ltd", "şti",
+    }
+
+    HARD_END = re.compile(r'[.!?…]+')
+
+    TR_CONNECTOR_PAUSE = re.compile(
+        r',\s*(ancak|fakat|lakin|ama|oysa|halbuki|bunun\s+için|bu\s+nedenle|'
+        r'bu\s+yüzden|dolayısıyla|sonuç\s+olarak|öte\s+yandan|'
+        r'bir\s+taraftan|diğer\s+taraftan|ayrıca|dahası|üstelik|'
+        r'buna\s+ek\s+olarak|bunun\s+yanında|örneğin|mesela|'
+        r'yani|kısacası|özetle|sonuçta)\s',
+        re.IGNORECASE
+    )
+
+    def __init__(self, min_chars: int = 8):
+        super().__init__()
+        self.buffer = ""
+        self.min_chars = min_chars
+
+    def _is_abbreviation(self, text: str, dot_pos: int) -> bool:
+        before = text[:dot_pos].rstrip()
+        word = before.split()[-1].lower() if before.split() else ""
+        if word.isdigit():
+            return True
+        if len(word) == 1:
+            return True
+        if word.rstrip('.') in self.TR_ABBREVIATIONS:
+            return True
+        return False
+
+    def _find_sentence_boundary(self, text: str) -> int:
+        for match in self.HARD_END.finditer(text):
+            pos = match.end()
+            if match.group().startswith('.') and self._is_abbreviation(text, match.start()):
+                continue
+            if pos >= len(text) or text[pos] in (' ', '\n', '\t'):
+                return pos
+            if pos == len(text):
+                return pos
+
+        connector_match = self.TR_CONNECTOR_PAUSE.search(text)
+        if connector_match and connector_match.start() > self.min_chars:
+            return connector_match.start() + 1
+
+        if len(text) >= 40:
+            last_comma = text.rfind(',')
+            if last_comma > self.min_chars:
+                return last_comma + 1
+
+        return -1
+
+    async def _flush(self, text: str):
+        text = text.strip()
+        if len(text) >= self.min_chars:
+            logger.debug(f"📝 [SentenceBuffer → TTS]: '{text}'")
+            await self.push_frame(TextFrame(text=text))
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TextFrame):
+            self.buffer += frame.text
+            while True:
+                boundary = self._find_sentence_boundary(self.buffer)
+                if boundary == -1:
+                    break
+                sentence = self.buffer[:boundary]
+                self.buffer = self.buffer[boundary:].lstrip()
+                await self._flush(sentence)
+
+        elif isinstance(frame, (EndFrame, LLMMessagesUpdateFrame)):
+            if self.buffer.strip():
+                await self._flush(self.buffer)
+                self.buffer = ""
+            await self.push_frame(frame, direction)
+
+        else:
+            await self.push_frame(frame, direction)
 
 
 # --- SHARED STATE ---
@@ -203,14 +292,12 @@ class SoftwareEchoSuppressor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        # Asistan konuşuyorsa mikrofon sesini düşür
         if isinstance(frame, InputAudioRawFrame) and self.state.is_speaking:
             return
         await self.push_frame(frame, direction)
 
 
 # --- DOWNSTREAM TRACKER ---
-# FIX: BotStartedSpeakingFrame yerine TTSStartedFrame/TTSStoppedFrame kullanılıyor
 class BotSpeakingTracker(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
@@ -274,28 +361,6 @@ class FreeSWITCHInputProcessor(FrameProcessor):
 
 
 # --- WEBSOCKET OUTPUT ---
-# class WebSocketOutput(FrameProcessor):
-#     def __init__(self, websocket: WebSocket):
-#         super().__init__()
-#         self.websocket = websocket
-#         self._log_counter = 0
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-#         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
-#             try:
-#                 await self.websocket.send_bytes(frame.audio)
-#                 self._log_counter += 1
-#                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
-#                     logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
-#             except Exception as e:
-#                 if "closed" in str(e).lower() or "disconnect" in str(e).lower():
-#                     logger.warning("FreeSWITCH bağlantısı kapandı, TTS kesiliyor.")
-#                     # FIX: EndFrame göndermiyoruz, sadece logluyoruz
-#                 else:
-#                     logger.error(f"WebSocket ses gönderme hatası: {e}")
-#         await self.push_frame(frame, direction)
-
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -325,6 +390,7 @@ class WebSocketOutput(FrameProcessor):
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
         await self.push_frame(frame, direction)
 
+
 # --- DEBUG LOGGERS ---
 class STTLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -338,7 +404,7 @@ class LLMLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TextFrame):
-            logger.info(f"🧠 [LLM]: {frame.text}")
+            logger.debug(f"🧠 [LLM token]: {frame.text}")
         await self.push_frame(frame, direction)
 
 
@@ -365,6 +431,7 @@ async def websocket_endpoint(websocket: WebSocket):
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
+    sentence_buffer = SentenceBuffer(min_chars=8)
 
     pipeline = Pipeline([
         fs_input,
@@ -374,6 +441,7 @@ async def websocket_endpoint(websocket: WebSocket):
         context_aggregator_pair.user(),
         llm,
         llm_logger,
+        sentence_buffer,        # LLM tokenlarını biriktir, cümle tamamlanınca TTS'e gönder
         tts,
         bot_tracker,
         fs_output,
@@ -395,7 +463,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await runner.run(task)
 
     async def send_initial():
-        await asyncio.sleep(0.5)  # FIX: pipeline kurulana kadar bekle
+        await asyncio.sleep(0.5)
         logger.info("Cold Start mesajı gönderiliyor...")
         await task.queue_frame(initial_message)
 
