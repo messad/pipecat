@@ -7,7 +7,6 @@ import base64
 import json
 from typing import Dict, Any, Optional
 from deepgram import AsyncDeepgramClient
-from deepgram.audio.live import LiveOptions
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
@@ -26,7 +25,7 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.groq import GroqLLMService
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -123,15 +122,26 @@ def service_factory(config: dict):
     if stt_provider == "deepgram":
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options=LiveOptions(
+            # live_options=LiveOptions(
+            #     model=stt_model,
+            #     language=stt_language,
+            #     encoding="linear16",
+            #     sample_rate=stt_sample_rate,
+            #     channels=1,
+            #     interim_results=True,   # Deepgram docs'ta önerilen: açık kalsın
+            #     punctuate=True,
+            #     smart_format=True,      # Türkçe akıllı formatlama
+            #     profanity_filter=False,
+            # )
+            encoding="linear16",
+            channels=1,
+            sample_rate=stt_sample_rate,
+            settings=DeepgramSTTSettings(
                 model=stt_model,
                 language=stt_language,
-                encoding="linear16",
-                sample_rate=stt_sample_rate,
-                channels=1,
-                interim_results=True,   # Deepgram docs'ta önerilen: açık kalsın
+                interim_results=True,
                 punctuate=True,
-                smart_format=True,      # Türkçe akıllı formatlama
+                smart_format=True,
                 profanity_filter=False,
             )
         )
