@@ -6,7 +6,7 @@ import logging
 import base64
 import json
 from typing import Dict, Any, Optional
-from deepgram import LiveOptions
+from deepgram import LiveTranscriptionOptions as LiveOptions 
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
