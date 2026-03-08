@@ -399,10 +399,10 @@ async def websocket_endpoint(websocket: WebSocket):
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
     try:
-	    await tts.start(StartFrame())
-		logger.info("🔥 TTS warm-up tamamlandı.")
-	except Exception as e:
-	    logger.warning(f"TTS warm-up başarısız (önemli değil): {e}")
+        await tts.start(StartFrame())
+        logger.info("🔥 TTS warm-up tamamlandı.")
+    except Exception as e:
+        logger.warning(f"TTS warm-up başarısız (önemli değil): {e}")
 
     bot_state = BotSpeakingState()
     echo_suppressor = SoftwareEchoSuppressor(bot_state)
