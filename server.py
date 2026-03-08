@@ -118,7 +118,7 @@ def service_factory(config: dict):
     stt_model = config.get("stt_model", "nova-3")
     stt_language = config.get("stt_language", "tr")
     stt_sample_rate = config.get("stt_sample_rate", 8000)
-	deepgram_client = DeepgramClient(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    deepgram_client = DeepgramClient(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
     if stt_provider == "deepgram":
         stt = DeepgramSTTService(
