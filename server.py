@@ -48,7 +48,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     OutputAudioRawFrame,
-	UserTurnEndedFrame,
+	TurnEndedFrame,
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -222,7 +222,7 @@ class FillerWordInjector(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, UserTurnEndedFrame):
+        if isinstance(frame, TurnEndedFrame):
             filler = self._next_phrase()
             logger.debug(f"💬 [Dolgu]: '{filler}'")
             await self.push_frame(TextFrame(text=filler), direction)
