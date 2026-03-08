@@ -32,6 +32,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
+    LLMUserAggregator,
 )
 from pipecat.transcriptions.language import Language
 from pipecat.frames.frames import (
@@ -48,7 +49,6 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     OutputAudioRawFrame,
-	TurnEndedFrame,
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -220,13 +220,17 @@ class FillerWordInjector(FrameProcessor):
         self._phrase_index += 1
         return phrase
 
+    # Eski process_frame içindeki frame kontrolünü kaldır
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Sadece super çağır ve frame'i geçir (dolgu event'te ateşlenecek)
         await super().process_frame(frame, direction)
-        if isinstance(frame, TurnEndedFrame):
-            filler = self._next_phrase()
-            logger.debug(f"💬 [Dolgu]: '{filler}'")
-            await self.push_frame(TextFrame(text=filler), direction)
         await self.push_frame(frame, direction)
+
+    # Yeni: Kullanıcı turn'ı bittiğinde dolgu kelimesi ateşle
+    async def on_user_turn_stopped(self):
+        filler = self._next_phrase()
+        logger.debug(f"💬 [Dolgu]: '{filler}'")
+        await self.push_frame(TextFrame(text=filler))
 
 
 # --- SHARED STATE ---
