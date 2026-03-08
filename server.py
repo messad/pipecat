@@ -413,7 +413,6 @@ async def websocket_endpoint(websocket: WebSocket):
     task = PipelineTask(pipeline)
 
     # Cold start kaldırıldı — system_prompt yeterli, ajan kullanıcıyı bekler
-
     async def run_pipeline():
         await runner.run(task)  # ← burası mutlaka 4 boşluk girintili olmalı
 
