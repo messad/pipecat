@@ -36,8 +36,16 @@ COPY pyproject.toml uv.lock* ./
 #     websockets \
 #     greenswitch
     
-RUN uv pip install --system --upgrade \
-    "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]>=0.0.105" \
+# Git kur + Pipecat'i main branch'ten manuel install
+RUN apt-get update && apt-get install -y git \
+    && git clone --depth 1 https://github.com/pipecat-ai/pipecat.git /tmp/pipecat \
+    && cd /tmp/pipecat \
+    && uv pip install --system .[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage] \
+    && cd / && rm -rf /tmp/pipecat \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Diğer bağımlılıklar (mevcut listen aynı)
+RUN uv pip install --system \
     python-dotenv \
     loguru \
     transformers \
