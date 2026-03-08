@@ -24,17 +24,22 @@ COPY pyproject.toml uv.lock* ./
 # Listeye 'websockets' ve 'greenswitch' eklendi.
 # greenswitch -> FreeSWITCH ESL bağlantısı için şart.
 # websockets -> Pipecat transport için şart.
-RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
-    python-dotenv \
-    loguru \
-    transformers \
-    fastapi \
-    uvicorn \
-    torch \
-    pipecat-ai-small-webrtc-prebuilt \
-    aiortc \
-    websockets \
-    greenswitch
+# RUN uv pip install --system "pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage]" \
+#     python-dotenv \
+#     loguru \
+#     transformers \
+#     fastapi \
+#     uvicorn \
+#     torch \
+#     pipecat-ai-small-webrtc-prebuilt \
+#     aiortc \
+#     websockets \
+#     greenswitch
+    
+# Pipecat'i senin fork'undan veya resmi main'den GitHub üzerinden çek (en güncel)
+RUN uv pip install --system git+https://github.com/pipecat-ai/pipecat.git@main#egg=pipecat-ai[deepgram,groq,elevenlabs,openai,google,anthropic,vapi,daily,cartesia,silero,fal,fastapi,twilio,vonage] \
+    python-dotenv loguru transformers fastapi uvicorn torch pipecat-ai-small-webrtc-prebuilt aiortc websockets greenswitch
+
 
 # YENİ EK: Silero VAD ONNX modelini build-time'da indir (cache'e koy)
 # Bu, runtime'da torch.hub.load() hatasını önler
