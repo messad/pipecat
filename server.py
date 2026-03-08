@@ -6,7 +6,8 @@ import logging
 import base64
 import json
 from typing import Dict, Any, Optional
-from deepgram import DeepgramClient
+from deepgram import AsyncDeepgramClient
+from deepgram.audio.live import LiveOptions
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
@@ -118,12 +119,11 @@ def service_factory(config: dict):
     stt_model = config.get("stt_model", "nova-3")
     stt_language = config.get("stt_language", "tr")
     stt_sample_rate = config.get("stt_sample_rate", 8000)
-    deepgram_client = DeepgramClient(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
     if stt_provider == "deepgram":
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            live_options=deepgram_client.listen.live.v("1").options(
+            live_options=LiveOptions(
                 model=stt_model,
                 language=stt_language,
                 encoding="linear16",
