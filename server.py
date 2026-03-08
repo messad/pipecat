@@ -50,6 +50,8 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
     OutputAudioRawFrame,
 	UserStoppedSpeakingFrame,
+	VADUserStartedSpeakingFrame,
+	CancelFrame,
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -76,6 +78,15 @@ TR_FILLER_PHRASES = [
     "Bir saniye,",
 ]
 
+class FastBargeInHandler(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, TTS kesiliyor...")
+            await self.push_frame(CancelFrame(), direction)   # TTS'i anında durdurur
+
+        await self.push_frame(frame, direction)
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -155,10 +166,10 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.75,             # Türkçe sondan eklemeli yapı için ideal
-            start_secs=0.4,             # min_speech_duration karşılığı
-            min_volume=0.6,
-            confidence=0.8
+            stop_secs=0.65,             # Türkçe sondan eklemeli yapı için ideal
+            start_secs=0.35,             # min_speech_duration karşılığı
+            min_volume=0.55,
+            confidence=0.82
         )
     )
 
@@ -199,8 +210,8 @@ def service_factory(config: dict):
             sample_rate=8000,
             model=config.get("tts_model", "sonic-multilingual"),
             language=Language.TR,
-            speed=0.95,
-            emotion="friendly",
+            speed=0.92,
+            emotion="cheerful",
 			text_aggregation_mode=TextAggregationMode.SENTENCE
             # text_aggregation_mode=TextAggregationMode.TOKEN     # düşük latency istersen
         )
@@ -416,6 +427,7 @@ async def websocket_endpoint(websocket: WebSocket):
     pipeline = Pipeline([
         fs_input,
         echo_suppressor,
+		FastBargeInHandler(),
         stt,
         stt_logger,
         context_aggregator_pair.user(),
