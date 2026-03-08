@@ -411,9 +411,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
-	
+
+    # Cold start kaldırıldı — system_prompt yeterli, ajan kullanıcıyı bekler
+
     async def run_pipeline():
-        await runner.run(task)
+        await runner.run(task)  # ← burası mutlaka 4 boşluk girintili olmalı
 
     logger.info("Pipeline başlatılıyor...")
     try:
