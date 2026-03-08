@@ -49,6 +49,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     OutputAudioRawFrame,
+	UserStoppedSpeakingFrame,
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -230,17 +231,13 @@ class FillerWordInjector(FrameProcessor):
         self._phrase_index += 1
         return phrase
 
-    # Eski process_frame içindeki frame kontrolünü kaldır
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # Sadece super çağır ve frame'i geçir (dolgu event'te ateşlenecek)
         await super().process_frame(frame, direction)
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            filler = self._next_phrase()
+            logger.debug(f"💬 [Dolgu]: '{filler}'")
+            await self.push_frame(TextFrame(text=filler), direction)
         await self.push_frame(frame, direction)
-
-    # Yeni: Kullanıcı turn'ı bittiğinde dolgu kelimesi ateşle
-    async def on_user_turn_stopped(self):
-        filler = self._next_phrase()
-        logger.debug(f"💬 [Dolgu]: '{filler}'")
-        await self.push_frame(TextFrame(text=filler))
 
 
 # --- SHARED STATE ---
@@ -254,21 +251,22 @@ class SoftwareEchoSuppressor(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
         self.state = state
-        self._speech_start_time = None
-        self._min_interruption_secs = 0.5  # 800ms konuşmadan önce interrupt yok
+        self._consecutive_speech_frames = 0
+        self._barge_in_threshold = 15  # ~600ms @ 8000Hz/320byte chunks
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, InputAudioRawFrame) and self.state.is_speaking:
-            now = asyncio.get_event_loop().time()
-            if self._speech_start_time is None:
-                self._speech_start_time = now
-            elapsed = now - self._speech_start_time
-            if elapsed < self._min_interruption_secs:
-                return  # henüz yeterince konuşmadı, drop
-            # 500ms geçti, gerçek interrupt — mikrofonu aç
+            self._consecutive_speech_frames += 1
+            # Kısa ses gelirse (eko/yansıma) drop et
+            # Uzun ve sürekli ses gelirse (gerçek barge-in) geçir
+            if self._consecutive_speech_frames < self._barge_in_threshold:
+                return
         else:
-            self._speech_start_time = None
+            if not self.state.is_speaking:
+                self._consecutive_speech_frames = 0
+
         await self.push_frame(frame, direction)
 
 
