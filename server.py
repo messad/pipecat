@@ -344,7 +344,7 @@ class WebSocketOutput(FrameProcessor):
                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
                     logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
             except Exception as e:
-				err = str(e).lower()
+                err = str(e).lower()
                 if "closed" in err or "disconnect" in err or "runtime" in err:
                     logger.warning("FreeSWITCH bağlantısı kapandı.")
                 else:
