@@ -49,6 +49,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     OutputAudioRawFrame,
+	UserTurnEndedFrame,
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -146,7 +147,7 @@ def service_factory(config: dict):
             stop_secs=0.75,             # Türkçe sondan eklemeli yapı için ideal
             start_secs=0.4,             # min_speech_duration karşılığı
             min_volume=0.6,
-            confidence=0.75
+            confidence=0.8
         )
     )
 
@@ -172,7 +173,9 @@ def service_factory(config: dict):
     elif llm_provider == "groq":
         llm = GroqLLMService(
             api_key=os.getenv("GROQ_API_KEY"),
-            model=config.get("llm_model", "llama-3.3-70b-versatile")
+            model=config.get("llm_model", "llama-3.3-70b-versatile"),
+			temperature=0.7,
+			top_p=0.9
         )
     else:
         raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
@@ -183,11 +186,11 @@ def service_factory(config: dict):
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id=config.get("tts_voice_id") or "39f753ef-b0eb-41cd-aa53-2f3c284f948f",
             sample_rate=8000,
-            model=config.get("tts_model", "sonic-multilingual"),  # ← postmandan gelir
+            model=config.get("tts_model", "sonic-multilingual"),
             language=Language.TR,
-            speed=0.9,
+            speed=0.95,
             emotion="friendly",
-			# text_aggregation_mode=TextAggregationMode.SENTENCE  # default, gerek yok
+			text_aggregation_mode=TextAggregationMode.SENTENCE
             # text_aggregation_mode=TextAggregationMode.TOKEN     # düşük latency istersen
         )
     elif tts_provider == "elevenlabs":
@@ -207,11 +210,10 @@ def service_factory(config: dict):
 # dolgu cümlesi TTS'e gönderilir. Gecikme hissini maskeler.
 # ---------------------------------------------------------------------------
 class FillerWordInjector(FrameProcessor):
-    def __init__(self, tts_input_queue_frame_pusher, phrases: list):
+    def __init__(self, phrases: list):
         super().__init__()
         self.phrases = phrases
         self._phrase_index = 0
-        self._injected = False
 
     def _next_phrase(self) -> str:
         phrase = self.phrases[self._phrase_index % len(self.phrases)]
@@ -220,18 +222,10 @@ class FillerWordInjector(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
-        # LLM yeni bir tur başlattığında dolgu kelimesini enjekte et
-        if isinstance(frame, LLMMessagesUpdateFrame):
-            self._injected = False
-
-        if isinstance(frame, TextFrame) and not self._injected:
-            self._injected = True
+        if isinstance(frame, UserTurnEndedFrame):
             filler = self._next_phrase()
             logger.debug(f"💬 [Dolgu]: '{filler}'")
-            # Dolgu kelimesini önce gönder, ardından asıl frame'i geç
             await self.push_frame(TextFrame(text=filler), direction)
-
         await self.push_frame(frame, direction)
 
 
@@ -246,11 +240,21 @@ class SoftwareEchoSuppressor(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
         self.state = state
+        self._speech_start_time = None
+        self._min_interruption_secs = 0.5  # 800ms konuşmadan önce interrupt yok
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame) and self.state.is_speaking:
-            return
+            now = asyncio.get_event_loop().time()
+            if self._speech_start_time is None:
+                self._speech_start_time = now
+            elapsed = now - self._speech_start_time
+            if elapsed < self._min_interruption_secs:
+                return  # henüz yeterince konuşmadı, drop
+            # 500ms geçti, gerçek interrupt — mikrofonu aç
+        else:
+            self._speech_start_time = None
         await self.push_frame(frame, direction)
 
 
@@ -341,7 +345,8 @@ class WebSocketOutput(FrameProcessor):
                 if self._log_counter <= 5 or self._log_counter % 100 == 0:
                     logger.info(f"🔊 [SES GÖNDERİLDİ] {len(frame.audio)} byte (Paket #{self._log_counter})")
             except Exception as e:
-                if "closed" in str(e).lower() or "disconnect" in str(e).lower():
+			    err = str(e).lower()
+                if "closed" in err or "disconnect" in err or "runtime" in err:
                     logger.warning("FreeSWITCH bağlantısı kapandı.")
                 else:
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
@@ -388,7 +393,7 @@ async def websocket_endpoint(websocket: WebSocket):
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
-    filler_injector = FillerWordInjector(None, TR_FILLER_PHRASES)
+    filler_injector =  FillerWordInjector(TR_FILLER_PHRASES)
 
     pipeline = Pipeline([
         fs_input,
