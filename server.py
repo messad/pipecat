@@ -283,7 +283,7 @@ def service_factory(config: dict):
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
             settings=OpenAILLMSettings(
-                model=llm_model,                      # gpt-4o en doğal Türkçe
+                model=config.get("llm_model", "gpt-4o-mini"), # gpt-4o en doğal Türkçe
                 temperature=0.7,                      # doğal varyasyon için ideal
                 top_p=0.9,
                 max_tokens=512,
