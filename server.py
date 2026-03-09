@@ -466,9 +466,9 @@ async def websocket_endpoint(websocket: WebSocket):
     
 	call_end_detector = CallEndDetector(
         call_id=call_id,
-        esl_host=FS_HOST,
-        esl_port=FS_ESL_PORT,
-        esl_password=FS_ESL_PASSWORD
+        esl_host=FREESWITCH_HOST,
+        esl_port=FREESWITCH_ESL_PORT,
+        esl_password=FREESWITCH_ESL_PASSWORD
     )
     pipeline = Pipeline([
         fs_input,
