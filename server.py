@@ -52,6 +52,7 @@ from pipecat.frames.frames import (
 	UserStoppedSpeakingFrame,
 	VADUserStartedSpeakingFrame,
 	CancelFrame,
+	ResetFrame
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -77,14 +78,19 @@ TR_FILLER_PHRASES = [
     "Hemen bakıyorum,",
     "Bir saniye,",
 ]
-
+		
 class FastBargeInHandler(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, TTS kesiliyor...")
-            await self.push_frame(CancelFrame(), direction)   # TTS'i anında durdurur
+            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, TTS + STT resetleniyor...")
+            
+            # TTS'i anında kes
+            await self.push_frame(CancelFrame(), direction)
+            
+            # STT'yi yeniden başlat (en kritik kısım)
+            await self.push_frame(ResetFrame(), direction)
 
         await self.push_frame(frame, direction)
 
@@ -167,9 +173,9 @@ def service_factory(config: dict):
         sample_rate=stt_sample_rate,
         params=VADParams(
             stop_secs=0.65,             # Türkçe sondan eklemeli yapı için ideal
-            start_secs=0.35,             # min_speech_duration karşılığı
+            start_secs=0.30,             # min_speech_duration karşılığı
             min_volume=0.55,
-            confidence=0.82
+            confidence=0.85
         )
     )
 
