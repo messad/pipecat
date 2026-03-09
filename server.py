@@ -464,7 +464,7 @@ async def websocket_endpoint(websocket: WebSocket):
     llm_logger = LLMLogger()
     filler_injector =  FillerWordInjector(TR_FILLER_PHRASES)
     
-	call_end_detector = CallEndDetector(
+    call_end_detector = CallEndDetector(
         call_id=call_id,
         esl_host=FS_HOST,
         esl_port=FS_ESL_PORT,
