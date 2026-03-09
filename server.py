@@ -22,7 +22,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.groq import GroqLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
