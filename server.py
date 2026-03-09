@@ -84,19 +84,11 @@ TR_FILLER_PHRASES = [
     "Hemen bakıyorum,",
     "Bir saniye,",
 ]
-		
-class FastBargeInHandler(FrameProcessor):
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, asistan susturuluyor...")
-            
-            # InterruptionFrame → TTS + LLM kesilir, sistem dinlemeye döner
-            await self.push_frame(InterruptionFrame(), direction)
-
-        # Frame'i normal akışına devam ettir
-        await self.push_frame(frame, direction)
+CANCEL_KEYWORDS = [
+    "dur", "bekle", "devam et", "devam edelim", "iptal",
+    "aslında", "hayır kapat", "kapatma"
+]
 
 class CallEndDetector(FrameProcessor):
     def __init__(self, call_id: str, esl_host: str, esl_port: int, esl_password: str):
@@ -105,6 +97,8 @@ class CallEndDetector(FrameProcessor):
         self.esl_host = esl_host
         self.esl_port = esl_port
         self.esl_password = esl_password
+        self._pending_hangup = False
+        self._hangup_task = None
 
     async def _hangup_via_esl(self):
         try:
@@ -113,26 +107,84 @@ class CallEndDetector(FrameProcessor):
             writer.write(f"auth {self.esl_password}\n\n".encode())
             await writer.drain()
             await reader.readuntil(b"\n\n")
-            cmd = f"api uuid_kill {self.call_id}\n\n"
-            writer.write(cmd.encode())
+            writer.write(f"api uuid_kill {self.call_id}\n\n".encode())
             await writer.drain()
             await reader.readuntil(b"\n\n")
             writer.close()
             await writer.wait_closed()
-            logger.info(f"📵 [CallEnd] ESL hangup gönderildi: {self.call_id}")
+            logger.info(f"📵 [CallEnd] ESL hangup gönderildi.")
         except Exception as e:
             logger.error(f"ESL hangup hatası: {e}")
 
+    async def _delayed_hangup(self, task: PipelineTask):
+        """TTS bittikten sonra 2 saniye bekle, iptal gelmezse kapat."""
+        try:
+            await asyncio.sleep(2.0)
+            if self._pending_hangup:
+                logger.info("📵 [CallEnd] Bekleme süresi doldu, kapatılıyor.")
+                await self._hangup_via_esl()
+                await task.queue_frame(EndFrame())
+        except asyncio.CancelledError:
+            logger.info("📵 [CallEnd] Hangup iptal edildi.")
+        finally:
+            self._pending_hangup = False
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.lower().strip()
-            if any(kw in text for kw in HANGUP_KEYWORDS):
-                logger.info(f"📵 [CallEnd] Kapatma kelimesi algılandı: '{frame.text}'")
-                await self._hangup_via_esl()
-                await self.push_frame(EndFrame(), direction)
+
+            # Kullanıcı "dur/devam et" dedi — hangup iptal
+            if self._pending_hangup and any(kw in text for kw in CANCEL_KEYWORDS):
+                logger.info("📵 [CallEnd] Kullanıcı iptal etti, devam ediliyor.")
+                self._pending_hangup = False
+                if self._hangup_task:
+                    self._hangup_task.cancel()
+                    self._hangup_task = None
+                await self.push_frame(frame, direction)
                 return
+
+            # Kapatma kelimesi algılandı
+            if any(kw in text for kw in HANGUP_KEYWORDS):
+                logger.info(f"📵 [CallEnd] Kapatma algılandı: '{frame.text}'")
+                self._pending_hangup = True
+                # LLM'e veda cümlesi söylet
+                veda = LLMMessagesUpdateFrame(
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Kullanıcı görüşmeyi bitirmek istiyor. "
+                            "Tek cümleyle nazikçe veda et ve 'görüşmek üzere' veya "
+                            "'iyi günler dilerim' gibi bir kapanış yap. "
+                            "Sonra sistem otomatik kapatacak."
+                        )
+                    }],
+                    run_llm=True
+                )
+                await self.push_frame(veda, direction)
+                return
+
+        # TTS bitti + hangup bekliyorsa timer başlat
+        if isinstance(frame, TTSStoppedFrame) and self._pending_hangup:
+            if not self._hangup_task or self._hangup_task.done():
+                # task referansına ihtiyacımız var, FrameProcessor'dan alalım
+                self._hangup_task = asyncio.create_task(
+                    self._delayed_hangup_simple()
+                )
+
         await self.push_frame(frame, direction)
+
+    async def _delayed_hangup_simple(self):
+        try:
+            await asyncio.sleep(2.0)
+            if self._pending_hangup:
+                await self._hangup_via_esl()
+                await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._pending_hangup = False
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -212,7 +264,7 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.65,             # Türkçe sondan eklemeli yapı için ideal
+            stop_secs=1.1,             # Türkçe sondan eklemeli yapı için ideal
             start_secs=0.30,             # min_speech_duration karşılığı
             min_volume=0.55,
             confidence=0.85
@@ -230,7 +282,19 @@ def service_factory(config: dict):
     if llm_provider == "openai":
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model=config.get("llm_model", "gpt-4o")
+            settings=OpenAILLMSettings(
+                model=llm_model,                      # gpt-4o en doğal Türkçe
+                temperature=0.7,                      # doğal varyasyon için ideal
+                top_p=0.9,
+                max_tokens=512,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                # Türkçe için ekstra optimizasyon
+                system_instruction="sayıları her zaman yazı ile türet yirmi beş gibi",
+                # Diğer ayarlar (isteğe bağlı)
+                seed=42,                              # tekrarlanabilirlik için
+                extra={"response_format": {"type": "text"}}  # sadece metin
+            )
         )
     elif llm_provider == "anthropic":
         llm = AnthropicLLMService(
@@ -473,7 +537,6 @@ async def websocket_endpoint(websocket: WebSocket):
     pipeline = Pipeline([
         fs_input,
         echo_suppressor,
-		FastBargeInHandler(),
         stt,
         stt_logger,
 		call_end_detector,
