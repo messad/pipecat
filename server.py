@@ -51,7 +51,8 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
 	UserStoppedSpeakingFrame,
 	VADUserStartedSpeakingFrame,
-	InterruptionFrame
+	InterruptionFrame,
+	CancelFrame
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -68,6 +69,12 @@ FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://pipecatcon:8000")
+HANGUP_KEYWORDS = [
+    "güle güle", "görüşürüz", "hoşça kal", "hoşçakal",
+    "kapat", "kapatıyorum", "kapatalım", "tamam kapat",
+    "bay bay", "iyi günler", "iyi akşamlar", "iyi geceler",
+    "teşekkürler görüşürüz", "çok teşekkürler hoşça kal"
+]
 
 # Türkçe dolgu kelimeleri — LLM cevap üretirken araya girer, gecikmeyi maskeler
 TR_FILLER_PHRASES = [
@@ -89,6 +96,42 @@ class FastBargeInHandler(FrameProcessor):
             await self.push_frame(InterruptionFrame(), direction)
 
         # Frame'i normal akışına devam ettir
+        await self.push_frame(frame, direction)
+
+class CallEndDetector(FrameProcessor):
+    def __init__(self, call_id: str, esl_host: str, esl_port: int, esl_password: str):
+        super().__init__()
+        self.call_id = call_id
+        self.esl_host = esl_host
+        self.esl_port = esl_port
+        self.esl_password = esl_password
+
+    async def _hangup_via_esl(self):
+        try:
+            reader, writer = await asyncio.open_connection(self.esl_host, self.esl_port)
+            await reader.readuntil(b"auth/request\n\n")
+            writer.write(f"auth {self.esl_password}\n\n".encode())
+            await writer.drain()
+            await reader.readuntil(b"\n\n")
+            cmd = f"api uuid_kill {self.call_id}\n\n"
+            writer.write(cmd.encode())
+            await writer.drain()
+            await reader.readuntil(b"\n\n")
+            writer.close()
+            await writer.wait_closed()
+            logger.info(f"📵 [CallEnd] ESL hangup gönderildi: {self.call_id}")
+        except Exception as e:
+            logger.error(f"ESL hangup hatası: {e}")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.lower().strip()
+            if any(kw in text for kw in HANGUP_KEYWORDS):
+                logger.info(f"📵 [CallEnd] Kapatma kelimesi algılandı: '{frame.text}'")
+                await self._hangup_via_esl()
+                await self.push_frame(EndFrame(), direction)
+                return
         await self.push_frame(frame, direction)
 
 class OutboundCallRequest(BaseModel):
@@ -412,12 +455,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
-    try:
-        await tts.start(StartFrame())
-        logger.info("🔥 TTS warm-up tamamlandı.")
-    except Exception as e:
-        logger.warning(f"TTS warm-up başarısız (önemli değil): {e}")
-
     bot_state = BotSpeakingState()
     echo_suppressor = SoftwareEchoSuppressor(bot_state)
     bot_tracker = BotSpeakingTracker(bot_state)
@@ -426,13 +463,20 @@ async def websocket_endpoint(websocket: WebSocket):
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
     filler_injector =  FillerWordInjector(TR_FILLER_PHRASES)
-
+    
+	call_end_detector = CallEndDetector(
+        call_id=call_id,
+        esl_host=FS_HOST,
+        esl_port=FS_ESL_PORT,
+        esl_password=FS_ESL_PASSWORD
+    )
     pipeline = Pipeline([
         fs_input,
         echo_suppressor,
 		FastBargeInHandler(),
         stt,
         stt_logger,
+		call_end_detector,
         context_aggregator_pair.user(),
         llm,
         llm_logger,
@@ -449,10 +493,15 @@ async def websocket_endpoint(websocket: WebSocket):
     # Cold start kaldırıldı — system_prompt yeterli, ajan kullanıcıyı bekler
     async def run_pipeline():
         await runner.run(task)  # ← burası mutlaka 4 boşluk girintili olmalı
+	
+	async def warmup_tts():
+	    await asyncio.sleep(1.0)
+		await task.queue_frame(TextFrame(text=" ")) 
+		logger.info("🔥 TTS warm-up frame gönderildi.")
 
     logger.info("Pipeline başlatılıyor...")
     try:
-        await run_pipeline()
+        await asyncio.gather(run_pipeline(), warmup_tts())
     except Exception as e:
         logger.error(f"Pipeline hatası: {e}")
     finally:
