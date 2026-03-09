@@ -494,10 +494,10 @@ async def websocket_endpoint(websocket: WebSocket):
     async def run_pipeline():
         await runner.run(task)  # ← burası mutlaka 4 boşluk girintili olmalı
 	
-	async def warmup_tts():
-	    await asyncio.sleep(1.0)
-		await task.queue_frame(TextFrame(text=" ")) 
-		logger.info("🔥 TTS warm-up frame gönderildi.")
+    async def warmup_tts():
+        await asyncio.sleep(1.0)
+        await task.queue_frame(TextFrame(text=" ")) 
+        logger.info("🔥 TTS warm-up frame gönderildi.")
 
     logger.info("Pipeline başlatılıyor...")
     try:
