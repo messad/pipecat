@@ -51,8 +51,7 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
 	UserStoppedSpeakingFrame,
 	VADUserStartedSpeakingFrame,
-	CancelFrame,
-	ResetFrame
+	InterruptionFrame
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -84,14 +83,12 @@ class FastBargeInHandler(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, TTS + STT resetleniyor...")
+            logger.info("⚡ [BARGE-IN] Kullanıcı araya girdi, asistan susturuluyor...")
             
-            # TTS'i anında kes
-            await self.push_frame(CancelFrame(), direction)
-            
-            # STT'yi yeniden başlat (en kritik kısım)
-            await self.push_frame(ResetFrame(), direction)
+            # InterruptionFrame → TTS + LLM kesilir, sistem dinlemeye döner
+            await self.push_frame(InterruptionFrame(), direction)
 
+        # Frame'i normal akışına devam ettir
         await self.push_frame(frame, direction)
 
 class OutboundCallRequest(BaseModel):
