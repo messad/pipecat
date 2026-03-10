@@ -37,7 +37,6 @@ from pipecat.frames.frames import (
     LLMMessagesAppendFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
-    LLMUpdateSettingsFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -211,6 +210,7 @@ class OpenAIRealtimeLLMService(LLMService):
     management, and real-time transcription.
     """
 
+    Settings = OpenAIRealtimeLLMSettings
     _settings: OpenAIRealtimeLLMSettings
 
     # Overriding the default adapter to use the OpenAIRealtimeLLMAdapter one.

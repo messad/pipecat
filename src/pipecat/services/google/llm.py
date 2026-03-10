@@ -16,7 +16,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, ClassVar, Dict, List, Literal, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 from loguru import logger
 from PIL import Image
@@ -35,7 +35,6 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMMessagesFrame,
-    LLMTextFrame,
     LLMThoughtEndFrame,
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
@@ -743,6 +742,7 @@ class GoogleLLMService(LLMService):
     expected by the Google AI model.
     """
 
+    Settings = GoogleLLMSettings
     _settings: GoogleLLMSettings
 
     # Overriding the default adapter to use the Gemini one.

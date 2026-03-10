@@ -371,7 +371,7 @@ class AWSBedrockLLMContext(OpenAILLMContext):
                     tool_result_content = [{"json": content_json}]
                 else:
                     tool_result_content = [{"text": message["content"]}]
-            except:
+            except (json.JSONDecodeError, ValueError, AttributeError):
                 tool_result_content = [{"text": message["content"]}]
 
             return {
@@ -746,6 +746,7 @@ class AWSBedrockLLMService(LLMService):
     vision capabilities.
     """
 
+    Settings = AWSBedrockLLMSettings
     _settings: AWSBedrockLLMSettings
 
     # Overriding the default adapter to use the Anthropic one.

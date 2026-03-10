@@ -24,7 +24,7 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
+from typing import Any, AsyncGenerator, List, Literal, Optional
 
 from loguru import logger
 from pydantic import BaseModel
@@ -558,6 +558,7 @@ class GoogleHttpTTSService(TTSService):
         Chirp and Journey voices don't support SSML and will use plain text input.
     """
 
+    Settings = GoogleHttpTTSSettings
     _settings: GoogleHttpTTSSettings
 
     class InputParams(BaseModel):
@@ -1020,6 +1021,7 @@ class GoogleTTSService(GoogleBaseTTSService):
         )
     """
 
+    Settings = GoogleTTSSettings
     _settings: GoogleTTSSettings
 
     class InputParams(BaseModel):
@@ -1198,6 +1200,7 @@ class GeminiTTSService(GoogleBaseTTSService):
         )
     """
 
+    Settings = GeminiTTSSettings
     _settings: GeminiTTSSettings
 
     GOOGLE_SAMPLE_RATE = 24000  # Google TTS always outputs at 24kHz
