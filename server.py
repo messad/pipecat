@@ -401,7 +401,11 @@ class InstantBargeInHandler(FrameProcessor):
 
 # --- DOWNSTREAM TRACKER ---
 class BotSpeakingTracker(FrameProcessor):
-    async def process_frame(self, frame, direction):
+    def __init__(self, state: BotSpeakingState):
+        super().__init__()
+        self.state = state
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSStartedFrame):
             self.state.is_speaking = True
