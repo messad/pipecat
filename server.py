@@ -369,22 +369,37 @@ class InstantBargeInHandler(FrameProcessor):
         super().__init__()
         self.state = state
         self._consecutive_frames = 0
-        self._threshold = 5  # ~200ms
+        self._threshold = 20
+        self._tts_started_at = None
+        self._echo_window_secs = 1.2  # TTS başlayınca ilk 1.2 saniye barge-in yok
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, TTSStartedFrame):
+            self._tts_started_at = asyncio.get_event_loop().time()
+            self._consecutive_frames = 0
+
+        if isinstance(frame, TTSStoppedFrame):
+            self._tts_started_at = None
+            self._consecutive_frames = 0
+
         if isinstance(frame, InputAudioRawFrame):
             if self.state.is_speaking:
+                # Echo window içindeyiz — drop et
+                if self._tts_started_at is not None:
+                    elapsed = asyncio.get_event_loop().time() - self._tts_started_at
+                    if elapsed < self._echo_window_secs:
+                        return  # yankı penceresi, geçirme
+
                 self._consecutive_frames += 1
                 if self._consecutive_frames >= self._threshold:
-                    # Gerçek barge-in: interrupt gönder, mikrofonu aç
                     logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
                     self.state.is_speaking = False
                     self._consecutive_frames = 0
+                    self._tts_started_at = None
                     await self.push_frame(InterruptionFrame(), direction)
                 else:
-                    # Henüz threshold dolmadı, eko olabilir — geçir ama say
                     await self.push_frame(frame, direction)
                     return
             else:
