@@ -4,6 +4,7 @@ FROM python:3.11-slim-bookworm
 # 1. ADIM: uv binary'sini resmi imajdan kopyala
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN ruff format . --check || true
+RUN pip install pyrnnoise webrtc-audio-processing numpy
 # 2. ADIM: Sistem paketlerini kur
 # Pipecat ses işleme (audio/voice) için bu kütüphanelere muhtaçtır.
 RUN apt-get update && apt-get install -y --no-install-recommends \
