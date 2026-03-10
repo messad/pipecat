@@ -312,8 +312,8 @@ def service_factory(config: dict):
             language=Language.TR,
             settings=CartesiaTTSSettings(
                 generation_config={
-                    speed=0.92,
-                    emotion="cheerful"
+                    speed:0.92,
+                    emotion:"cheerful"
                 },    
                 pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
