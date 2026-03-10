@@ -12,6 +12,9 @@ from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
+import numpy as np
+from pyrnnoise import RNNoise
+from webrtc_audio_processing import AudioProcessingModule
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 logging.getLogger("websockets.client").setLevel(logging.WARNING)
@@ -175,6 +178,54 @@ class CallEndDetector(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+class AudioPreProcessor(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.rnnoise = RNNoise()
+        self.aec = AudioProcessingModule(enable_aec=True, enable_ns=True)
+        self._calibrated = False
+        self._user_rms_sum = 0.0
+        self._user_frame_count = 0
+        self._dynamic_min_volume = 0.35  # başlangıç değeri
+
+    def _rms(self, audio: bytes) -> float:
+        try:
+            return audioop.rms(audio, 2) / 32768.0  # normalize 0-1
+        except:
+            return 0.0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InputAudioRawFrame):
+            # 1. AEC uygula (yankı temizle)
+            processed = self.aec.process(frame.audio)
+
+            # 2. RNNoise uygula (gürültü temizle)
+            denoised = self.rnnoise.filter(processed)
+
+            # 3. Dinamik kalibrasyon (ilk konuşmada)
+            if not self._calibrated:
+                rms = self._rms(denoised)
+                if rms > 0.05:  # ses geldi
+                    self._user_rms_sum += rms
+                    self._user_frame_count += 1
+                    if self._user_frame_count >= 8:  # 8 frame ~250ms yeter
+                        avg_rms = self._user_rms_sum / self._user_frame_count
+                        self._dynamic_min_volume = max(0.18, avg_rms * 0.65)  # %65 kuralı
+                        self._calibrated = True
+                        logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
+
+            # VAD'e temizlenmiş audio'yu gönder
+            new_frame = InputAudioRawFrame(
+                audio=denoised,
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels
+            )
+            await self.push_frame(new_frame, direction)
+            return
+
+        await self.push_frame(frame, direction)
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -243,11 +294,11 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.4,
-            start_secs=0.15,
-            min_volume=0.35,
-            confidence=0.7,
-            min_speech_duration_ms=120
+            stop_secs=0.25,
+            start_secs=0.08,
+            min_volume=0.18,
+            confidence=0.6,
+            min_speech_duration_ms=80
         )
     )
 
@@ -319,7 +370,8 @@ def service_factory(config: dict):
                 ),    
                 pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
-            text_aggregation_mode=TextAggregationMode.SENTENCE
+            text_aggregation_mode=TextAggregationMode.SENTENCE,
+            text_aggregation_mode=TextAggregationMode.TOKEN
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -471,9 +523,11 @@ async def websocket_endpoint(websocket: WebSocket):
         esl_port=FS_ESL_PORT,
         esl_password=FS_ESL_PASSWORD
     )
-
+    audio_preprocessor = AudioPreProcessor()
+	
     pipeline = Pipeline([
         fs_input,
+        audio_preprocessor, 
         stt,
         stt_logger,
         call_end_detector,
