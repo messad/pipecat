@@ -179,14 +179,12 @@ class CallEndDetector(FrameProcessor):
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
-        self.processor = AudioProcessor(
-            agc_mode=1,     # adaptive gain (otomatik ses seviyesi dengeleme)
-            ns_level=2      # aggressive noise suppression
-        )
+        # kwargs kaldir, positional ver
+        self.processor = AudioProcessor(3, 2)  # auto_gain_dbfs=3 (hafif adaptive gain), noise_suppression_level=2 (moderate-aggressive)
         self._calibrated = False
         self._user_rms_sum = 0.0
         self._user_frame_count = 0
-        self._dynamic_min_volume = 0.35  # başlangıç
+        self._dynamic_min_volume = 0.35
 
     def _rms(self, audio: bytes) -> float:
         try:
