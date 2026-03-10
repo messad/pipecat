@@ -26,7 +26,7 @@ from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.groq import GroqLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
-from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode
+from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode, CartesiaTTSSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
