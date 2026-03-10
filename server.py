@@ -26,7 +26,7 @@ from pipecat.services.openai.llm import OpenAILLMService, OpenAILLMSettings
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.groq import GroqLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
-from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode, CartesiaTTSSettings
+from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode, CartesiaTTSSettings, GenerationConfig
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -311,10 +311,10 @@ def service_factory(config: dict):
             model=config.get("tts_model", "sonic-multilingual"),
             language=Language.TR,
             settings=CartesiaTTSSettings(
-                generation_config={
-                    speed:0.92,
-                    emotion:"cheerful"
-                },    
+                generation_config=GenerationConfig(
+                    speed=0.92,
+                    emotion="cheerful"
+                ),    
                 pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
             text_aggregation_mode=TextAggregationMode.SENTENCE
