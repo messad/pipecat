@@ -19,6 +19,7 @@ logging.getLogger("websockets.server").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# Güncel import'lar (repo'dan teyitli path'ler)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
@@ -33,7 +34,6 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
-    LLMUserAggregator,
 )
 from pipecat.transcriptions.language import Language
 from pipecat.frames.frames import (
@@ -50,14 +50,18 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     OutputAudioRawFrame,
-	UserStoppedSpeakingFrame,
-	VADUserStartedSpeakingFrame,
-	InterruptionFrame,
-	CancelFrame
+    UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    InterruptionFrame,
+    CancelFrame
 )
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+
+# Güncel turn stratejileri import'ları (repo'da var, örneklerde kullanılıyor)
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
@@ -70,6 +74,7 @@ FS_HOST = os.getenv("FREESWITCH_HOST", "freeswitchcon")
 FS_ESL_PORT = int(os.getenv("FREESWITCH_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FREESWITCH_ESL_PASSWORD", "ClueCon")
 PIPECAT_WS_BASE = os.getenv("PIPECAT_WS_BASE_URL", "ws://pipecatcon:8000")
+
 HANGUP_KEYWORDS = [
     "güle güle", "görüşürüz", "hoşça kal", "hoşçakal",
     "kapat", "kapatıyorum", "kapatalım", "tamam kapat",
@@ -77,7 +82,6 @@ HANGUP_KEYWORDS = [
     "teşekkürler görüşürüz", "çok teşekkürler hoşça kal"
 ]
 
-# Türkçe dolgu kelimeleri — LLM cevap üretirken araya girer, gecikmeyi maskeler
 TR_FILLER_PHRASES = [
     "Hmm...",
     "Tabii,",
@@ -91,6 +95,7 @@ CANCEL_KEYWORDS = [
     "aslında", "hayır kapat", "kapatma"
 ]
 
+# Mevcut custom class'ların (değişiklik yok, sadece duplicate temizlendi)
 class CallEndDetector(FrameProcessor):
     def __init__(self, call_id: str, esl_host: str, esl_port: int, esl_password: str):
         super().__init__()
@@ -100,7 +105,7 @@ class CallEndDetector(FrameProcessor):
         self.esl_password = esl_password
         self._pending_hangup = False
         self._hangup_task = None
-        self._task = None  # pipeline task referansı, endpoint'ten set edilecek
+        self._task = None
 
     async def _hangup_via_esl(self):
         try:
@@ -138,7 +143,6 @@ class CallEndDetector(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.lower().strip()
 
-            # pending_hangup varken — sadece iptal kontrolü yap, başka hiçbir şey tetikleme
             if self._pending_hangup:
                 if any(kw in text for kw in CANCEL_KEYWORDS):
                     logger.info("📵 [CallEnd] Kullanıcı iptal etti.")
@@ -148,34 +152,29 @@ class CallEndDetector(FrameProcessor):
                         self._hangup_task = None
                     await self.push_frame(frame, direction)
                 else:
-                    # Veda veya başka kelime — timer zaten çalışıyor, frame'i yut
                     logger.debug(f"📵 [CallEnd] Hangup beklenirken yeni transcript yutuldu: '{text}'")
                 return
 
-            # Normal akış — kapatma kelimesi kontrolü
             if any(kw in text for kw in HANGUP_KEYWORDS):
                 logger.info(f"📵 [CallEnd] Kapatma algılandı: '{frame.text}'")
                 self._pending_hangup = True
                 veda = LLMMessagesUpdateFrame(
                     messages=[{
                         "role": "user",
-                        "content": (
-                            "Kullanıcı görüşmeyi bitirmek istiyor. "
-                            "Tek cümleyle nazikçe veda et. Kısa tut."
-                        )
+                        "content": "Kullanıcı görüşmeyi bitirmek istiyor. Tek cümleyle nazikçe veda et. Kısa tut."
                     }],
                     run_llm=True
                 )
                 await self.push_frame(veda, direction)
                 return
 
-        # TTS bitti + hangup bekliyorsa timer başlat
         if isinstance(frame, TTSStoppedFrame) and self._pending_hangup:
             if not self._hangup_task or self._hangup_task.done():
                 logger.info("📵 [CallEnd] TTS bitti, hangup timer başlıyor (1.5s).")
                 self._hangup_task = asyncio.create_task(self._delayed_hangup())
 
         await self.push_frame(frame, direction)
+
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -191,7 +190,7 @@ class OutboundCallRequest(BaseModel):
     llm_model: Optional[str] = "llama-3.3-70b-versatile"
 
     tts_provider: Optional[str] = "cartesia"
-    tts_model: Optional[str] = "sonic-multilingual"   # ← postmandan gönderilebilir
+    tts_model: Optional[str] = "sonic-multilingual"
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
 
 
@@ -223,17 +222,6 @@ def service_factory(config: dict):
     if stt_provider == "deepgram":
         stt = DeepgramSTTService(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
-            # live_options=LiveOptions(
-            #     model=stt_model,
-            #     language=stt_language,
-            #     encoding="linear16",
-            #     sample_rate=stt_sample_rate,
-            #     channels=1,
-            #     interim_results=True,   # Deepgram docs'ta önerilen: açık kalsın
-            #     punctuate=True,
-            #     smart_format=True,      # Türkçe akıllı formatlama
-            #     profanity_filter=False,
-            # )
             encoding="linear16",
             channels=1,
             sample_rate=stt_sample_rate,
@@ -255,17 +243,32 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=1.1,             # Türkçe sondan eklemeli yapı için ideal
-            start_secs=0.30,             # min_speech_duration karşılığı
-            min_volume=0.55,
-            confidence=0.85
+            stop_secs=0.4,
+            start_secs=0.15,
+            min_volume=0.35,
+            confidence=0.7,
+            min_speech_duration_ms=120
         )
+    )
+
+    # Güncel: User turn stratejilerini ekle (repo örneklerinde bu şekilde)
+    user_turn_strategies = UserTurnStrategies(
+        start=[
+            VADUserTurnStartStrategy(
+                vad_analyzer=vad_analyzer,
+                enable_interruptions=True,
+                min_audio_duration_to_interrupt=0.15,  # ms değil sn, düşük tut
+                min_words_to_interrupt=2,
+            )
+        ]
+        # stop stratejisi istersen ekleyebilirsin, default akıllı
     )
 
     context_aggregator_pair = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad_analyzer
+            vad_analyzer=vad_analyzer,
+            user_turn_strategies=user_turn_strategies,  # ← eklenen kısım
         ),
     )
 
@@ -274,17 +277,15 @@ def service_factory(config: dict):
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
             settings=OpenAILLMSettings(
-                model=config.get("llm_model", "gpt-4o-mini"), # gpt-4o en doğal Türkçe
-                temperature=0.7,                      # doğal varyasyon için ideal
+                model=config.get("llm_model", "gpt-4o-mini"),
+                temperature=0.7,
                 top_p=0.9,
                 max_tokens=512,
                 frequency_penalty=0.0,
                 presence_penalty=0.0,
-                # Türkçe için ekstra optimizasyon
                 system_instruction="sayıları her zaman yazı ile türet yirmi beş gibi. Cümle başlangıcında ingilizce ile karıştırılabilecek kelimeleri kullanma örneğin Size nasıl yardımcı olabilirim? burda size ingilizce kelime ile karıştırılabilir. Cümlenin ilk kelimesi sadece Türkçede olan kelimeler olsun.",
-                # Diğer ayarlar (isteğe bağlı)
-                seed=42,                              # tekrarlanabilirlik için
-                extra={"response_format": {"type": "text"}}  # sadece metin
+                seed=42,
+                extra={"response_format": {"type": "text"}}
             )
         )
     elif llm_provider == "anthropic":
@@ -297,8 +298,8 @@ def service_factory(config: dict):
         llm = GroqLLMService(
             api_key=os.getenv("GROQ_API_KEY"),
             model=config.get("llm_model", "llama-3.3-70b-versatile"),
-			temperature=0.7,
-			top_p=0.9
+            temperature=0.7,
+            top_p=0.9
         )
     else:
         raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
@@ -319,7 +320,6 @@ def service_factory(config: dict):
                 pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
             text_aggregation_mode=TextAggregationMode.SENTENCE
-            # text_aggregation_mode=TextAggregationMode.TOKEN     # düşük latency istersen
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -332,11 +332,6 @@ def service_factory(config: dict):
     return stt, llm, tts, context_aggregator_pair
 
 
-# ---------------------------------------------------------------------------
-# DOLGU KELİMELERİ PROCESSOR
-# LLM cevap üretmeye başlar başlamaz ilk token gelmeden önce kısa bir
-# dolgu cümlesi TTS'e gönderilir. Gecikme hissini maskeler.
-# ---------------------------------------------------------------------------
 class FillerWordInjector(FrameProcessor):
     def __init__(self, phrases: list):
         super().__init__()
@@ -353,123 +348,9 @@ class FillerWordInjector(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             filler = self._next_phrase()
             logger.debug(f"💬 [Dolgu]: '{filler}'")
-            # Dolguyu önce gönder
             await self.push_frame(TextFrame(text=filler), direction)
-        # TranscriptionFrame'i HER ZAMAN downstream'e geçir
         await self.push_frame(frame, direction)
 
-
-# --- SHARED STATE ---
-class BotSpeakingState:
-    def __init__(self):
-        self.is_speaking = False
-
-# class InstantBargeInHandler(FrameProcessor):
-#     def __init__(self, state: BotSpeakingState):
-#         super().__init__()
-#         self.state = state
-#         self._consecutive_frames = 0
-#         self._threshold = 35
-#         self._echo_window_secs = 2.0
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-
-#         if isinstance(frame, InputAudioRawFrame):
-#             if self.state.is_speaking:
-#                 elapsed = asyncio.get_event_loop().time() - self.state.started_at
-#                 if elapsed < self._echo_window_secs:
-#                     # Echo window — tamamen drop et, say bile
-#                     self._consecutive_frames = 0
-#                     return
-
-#                 self._consecutive_frames += 1
-#                 if self._consecutive_frames >= self._threshold:
-#                     logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
-#                     self.state.is_speaking = False
-#                     self._consecutive_frames = 0
-#                     await self.push_frame(InterruptionFrame(), direction)
-#                 else:
-#                     await self.push_frame(frame, direction)
-#                     return
-#             else:
-#                 self._consecutive_frames = 0
-
-#         await self.push_frame(frame, direction)
-
-class InstantBargeInHandler(FrameProcessor):
-    def __init__(self, state: BotSpeakingState):
-        super().__init__()
-        self.state = state
-        self._consecutive_frames = 0
-        self._threshold = 12        # Gerçek konuşma için ardışık frame sayısı (8-20 arası test et)
-        self._rms_min = 400         # Yankı/gürültü eşiği — log'lardan kalibre edeceğiz
-
-    def _rms(self, audio: bytes) -> float:
-        try:
-            return audioop.rms(audio, 2)  # 16-bit PCM
-        except:
-            return 0.0
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, InputAudioRawFrame):
-            if self.state.is_speaking:
-                rms = self._rms(frame.audio)
-                if rms < self._rms_min:
-                    # Ses çok sessiz — yankı veya gürültü, drop et
-                    self._consecutive_frames = 0
-                    return
-
-                self._consecutive_frames += 1
-                if self._consecutive_frames >= self._threshold:
-                    logger.info(f"⚡ [BARGE-IN] Gerçek ses algılandı (RMS:{rms:.0f}), TTS kesiliyor.")
-                    self.state.is_speaking = False
-                    self._consecutive_frames = 0
-                    await self.push_frame(InterruptionFrame(), direction)
-                else:
-                    await self.push_frame(frame, direction)
-                    return
-            else:
-                self._consecutive_frames = 0
-
-        await self.push_frame(frame, direction)
-
-# --- DOWNSTREAM TRACKER ---
-# class BotSpeakingTracker(FrameProcessor):
-#     def __init__(self, state: BotSpeakingState):
-#         super().__init__()
-#         self.state = state
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-#         if isinstance(frame, TTSStartedFrame):
-#             self.state.is_speaking = True
-#             self.state.started_at = asyncio.get_event_loop().time()
-#             logger.info("🔇 [AEC] Mikrofon kapatıldı.")
-#         elif isinstance(frame, TTSStoppedFrame):
-#             self.state.is_speaking = False
-#             logger.info("🔊 [AEC] Mikrofon açıldı.")
-#         await self.push_frame(frame, direction)
-
-# --- DOWNSTREAM TRACKER ---
-class BotSpeakingTracker(FrameProcessor):
-    def __init__(self, state: BotSpeakingState):
-        super().__init__()
-        self.state = state
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TTSStartedFrame):
-            self.state.is_speaking = True
-            logger.info("🔇 [AEC] Mikrofon kapatıldı.")
-        elif isinstance(frame, TTSStoppedFrame):
-            self.state.is_speaking = False
-            logger.info("🔊 [AEC] Mikrofon açıldı.")
-        await self.push_frame(frame, direction)
-
-# --- FREESWITCH INPUT ---
 class FreeSWITCHInputProcessor(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -515,7 +396,6 @@ class FreeSWITCHInputProcessor(FrameProcessor):
             logger.info("🧹 FreeSWITCHInputProcessor: Temizlendi.")
 
 
-# --- WEBSOCKET OUTPUT ---
 class WebSocketOutput(FrameProcessor):
     def __init__(self, websocket: WebSocket):
         super().__init__()
@@ -547,7 +427,6 @@ class WebSocketOutput(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# --- DEBUG LOGGERS ---
 class STTLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -562,6 +441,7 @@ class LLMLogger(FrameProcessor):
         if isinstance(frame, TextFrame):
             logger.debug(f"🧠 [LLM token]: {frame.text}")
         await self.push_frame(frame, direction)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -579,9 +459,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
-    bot_state = BotSpeakingState()
-    barge_in_handler = InstantBargeInHandler(bot_state)  # SoftwareEchoSuppressor + FastBargeInHandler birleşti
-    bot_tracker = BotSpeakingTracker(bot_state)
     fs_input = FreeSWITCHInputProcessor(websocket)
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
@@ -597,23 +474,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
     pipeline = Pipeline([
         fs_input,
-        barge_in_handler,           # echo_suppressor + barge-in birleşik
         stt,
         stt_logger,
-        call_end_detector,          # kapatma kelimesi kontrolü
-        context_aggregator_pair.user(),
+        call_end_detector,
+        context_aggregator_pair.user(),  # user turn stratejileri burada aktif
         llm,
         llm_logger,
         filler_injector,
         tts,
-        bot_tracker,
         fs_output,
         context_aggregator_pair.assistant()
     ])
 
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
-    call_end_detector._task = task  # task referansını ver, delayed_hangup içinde kullanılacak
+    call_end_detector._task = task
 
     async def run_pipeline():
         await runner.run(task)
