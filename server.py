@@ -12,9 +12,7 @@ from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
-import numpy as np
-from pyrnnoise import RNNoise
-from webrtc_audio_processing import AudioProcessingModule
+from webrtc_noise_gain import AudioProcessor
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s")
 logging.getLogger("websockets.client").setLevel(logging.WARNING)
@@ -181,12 +179,14 @@ class CallEndDetector(FrameProcessor):
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
-        self.rnnoise = RNNoise()
-        self.aec = AudioProcessingModule(enable_aec=True, enable_ns=True)
+        self.processor = AudioProcessor(
+            agc_mode=1,     # adaptive gain (otomatik ses seviyesi dengeleme)
+            ns_level=2      # aggressive noise suppression
+        )
         self._calibrated = False
         self._user_rms_sum = 0.0
         self._user_frame_count = 0
-        self._dynamic_min_volume = 0.35  # başlangıç değeri
+        self._dynamic_min_volume = 0.35  # başlangıç
 
     def _rms(self, audio: bytes) -> float:
         try:
@@ -198,27 +198,23 @@ class AudioPreProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
-            # 1. AEC uygula (yankı temizle)
-            processed = self.aec.process(frame.audio)
+            # webrtc-noise-gain AudioProcessor bytes bekliyor, chunk'ları işle
+            processed_bytes = self.processor.process(frame.audio)  # direkt bytes döner
 
-            # 2. RNNoise uygula (gürültü temizle)
-            denoised = self.rnnoise.filter(processed)
-
-            # 3. Dinamik kalibrasyon (ilk konuşmada)
+            # Dinamik kalibrasyon (temizlenmiş audio ile)
             if not self._calibrated:
-                rms = self._rms(denoised)
-                if rms > 0.05:  # ses geldi
+                rms = self._rms(processed_bytes)
+                if rms > 0.05:  # anlamlı ses geldi
                     self._user_rms_sum += rms
                     self._user_frame_count += 1
-                    if self._user_frame_count >= 8:  # 8 frame ~250ms yeter
+                    if self._user_frame_count >= 8:  # ~250ms yeter
                         avg_rms = self._user_rms_sum / self._user_frame_count
-                        self._dynamic_min_volume = max(0.18, avg_rms * 0.65)  # %65 kuralı
+                        self._dynamic_min_volume = max(0.18, avg_rms * 0.65)
                         self._calibrated = True
                         logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
 
-            # VAD'e temizlenmiş audio'yu gönder
             new_frame = InputAudioRawFrame(
-                audio=denoised,
+                audio=processed_bytes,
                 sample_rate=frame.sample_rate,
                 num_channels=frame.num_channels
             )
@@ -370,7 +366,7 @@ def service_factory(config: dict):
                 ),    
                 pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
-            text_aggregation_mode=TextAggregationMode.SENTENCE,
+            #text_aggregation_mode=TextAggregationMode.SENTENCE,
             text_aggregation_mode=TextAggregationMode.TOKEN
         )
     elif tts_provider == "elevenlabs":
