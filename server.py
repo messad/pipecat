@@ -5,6 +5,7 @@ import asyncio
 import logging
 import base64
 import json
+import audioop
 from typing import Dict, Any, Optional
 from deepgram import AsyncDeepgramClient
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
@@ -362,31 +363,68 @@ class FillerWordInjector(FrameProcessor):
 class BotSpeakingState:
     def __init__(self):
         self.is_speaking = False
-        self.started_at: float = 0.0 
 
+# class InstantBargeInHandler(FrameProcessor):
+#     def __init__(self, state: BotSpeakingState):
+#         super().__init__()
+#         self.state = state
+#         self._consecutive_frames = 0
+#         self._threshold = 35
+#         self._echo_window_secs = 2.0
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+
+#         if isinstance(frame, InputAudioRawFrame):
+#             if self.state.is_speaking:
+#                 elapsed = asyncio.get_event_loop().time() - self.state.started_at
+#                 if elapsed < self._echo_window_secs:
+#                     # Echo window — tamamen drop et, say bile
+#                     self._consecutive_frames = 0
+#                     return
+
+#                 self._consecutive_frames += 1
+#                 if self._consecutive_frames >= self._threshold:
+#                     logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
+#                     self.state.is_speaking = False
+#                     self._consecutive_frames = 0
+#                     await self.push_frame(InterruptionFrame(), direction)
+#                 else:
+#                     await self.push_frame(frame, direction)
+#                     return
+#             else:
+#                 self._consecutive_frames = 0
+
+#         await self.push_frame(frame, direction)
 
 class InstantBargeInHandler(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
         self.state = state
         self._consecutive_frames = 0
-        self._threshold = 35
-        self._echo_window_secs = 2.0
+        self._threshold = 12        # Gerçek konuşma için ardışık frame sayısı (8-20 arası test et)
+        self._rms_min = 400         # Yankı/gürültü eşiği — log'lardan kalibre edeceğiz
+
+    def _rms(self, audio: bytes) -> float:
+        try:
+            return audioop.rms(audio, 2)  # 16-bit PCM
+        except:
+            return 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
             if self.state.is_speaking:
-                elapsed = asyncio.get_event_loop().time() - self.state.started_at
-                if elapsed < self._echo_window_secs:
-                    # Echo window — tamamen drop et, say bile
+                rms = self._rms(frame.audio)
+                if rms < self._rms_min:
+                    # Ses çok sessiz — yankı veya gürültü, drop et
                     self._consecutive_frames = 0
                     return
 
                 self._consecutive_frames += 1
                 if self._consecutive_frames >= self._threshold:
-                    logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
+                    logger.info(f"⚡ [BARGE-IN] Gerçek ses algılandı (RMS:{rms:.0f}), TTS kesiliyor.")
                     self.state.is_speaking = False
                     self._consecutive_frames = 0
                     await self.push_frame(InterruptionFrame(), direction)
@@ -398,6 +436,22 @@ class InstantBargeInHandler(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+# --- DOWNSTREAM TRACKER ---
+# class BotSpeakingTracker(FrameProcessor):
+#     def __init__(self, state: BotSpeakingState):
+#         super().__init__()
+#         self.state = state
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, TTSStartedFrame):
+#             self.state.is_speaking = True
+#             self.state.started_at = asyncio.get_event_loop().time()
+#             logger.info("🔇 [AEC] Mikrofon kapatıldı.")
+#         elif isinstance(frame, TTSStoppedFrame):
+#             self.state.is_speaking = False
+#             logger.info("🔊 [AEC] Mikrofon açıldı.")
+#         await self.push_frame(frame, direction)
 
 # --- DOWNSTREAM TRACKER ---
 class BotSpeakingTracker(FrameProcessor):
@@ -409,13 +463,11 @@ class BotSpeakingTracker(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSStartedFrame):
             self.state.is_speaking = True
-            self.state.started_at = asyncio.get_event_loop().time()
             logger.info("🔇 [AEC] Mikrofon kapatıldı.")
         elif isinstance(frame, TTSStoppedFrame):
             self.state.is_speaking = False
             logger.info("🔊 [AEC] Mikrofon açıldı.")
         await self.push_frame(frame, direction)
-
 
 # --- FREESWITCH INPUT ---
 class FreeSWITCHInputProcessor(FrameProcessor):
