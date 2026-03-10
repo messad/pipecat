@@ -362,6 +362,7 @@ class FillerWordInjector(FrameProcessor):
 class BotSpeakingState:
     def __init__(self):
         self.is_speaking = False
+        self.started_at: float = 0.0 
 
 
 class InstantBargeInHandler(FrameProcessor):
@@ -369,35 +370,25 @@ class InstantBargeInHandler(FrameProcessor):
         super().__init__()
         self.state = state
         self._consecutive_frames = 0
-        self._threshold = 20
-        self._tts_started_at = None
-        self._echo_window_secs = 1.2  # TTS başlayınca ilk 1.2 saniye barge-in yok
+        self._threshold = 35
+        self._echo_window_secs = 2.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TTSStartedFrame):
-            self._tts_started_at = asyncio.get_event_loop().time()
-            self._consecutive_frames = 0
-
-        if isinstance(frame, TTSStoppedFrame):
-            self._tts_started_at = None
-            self._consecutive_frames = 0
-
         if isinstance(frame, InputAudioRawFrame):
             if self.state.is_speaking:
-                # Echo window içindeyiz — drop et
-                if self._tts_started_at is not None:
-                    elapsed = asyncio.get_event_loop().time() - self._tts_started_at
-                    if elapsed < self._echo_window_secs:
-                        return  # yankı penceresi, geçirme
+                elapsed = asyncio.get_event_loop().time() - self.state.started_at
+                if elapsed < self._echo_window_secs:
+                    # Echo window — tamamen drop et, say bile
+                    self._consecutive_frames = 0
+                    return
 
                 self._consecutive_frames += 1
                 if self._consecutive_frames >= self._threshold:
                     logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
                     self.state.is_speaking = False
                     self._consecutive_frames = 0
-                    self._tts_started_at = None
                     await self.push_frame(InterruptionFrame(), direction)
                 else:
                     await self.push_frame(frame, direction)
@@ -410,18 +401,15 @@ class InstantBargeInHandler(FrameProcessor):
 
 # --- DOWNSTREAM TRACKER ---
 class BotSpeakingTracker(FrameProcessor):
-    def __init__(self, state: BotSpeakingState):
-        super().__init__()
-        self.state = state
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
+    async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSStartedFrame):
-            logger.info("🔇 [AEC] Asistan konuşmaya başladı, mikrofon kapatıldı.")
             self.state.is_speaking = True
+            self.state.started_at = asyncio.get_event_loop().time()
+            logger.info("🔇 [AEC] Mikrofon kapatıldı.")
         elif isinstance(frame, TTSStoppedFrame):
-            logger.info("🔊 [AEC] Asistan sustu, mikrofon açıldı.")
             self.state.is_speaking = False
+            logger.info("🔊 [AEC] Mikrofon açıldı.")
         await self.push_frame(frame, direction)
 
 
