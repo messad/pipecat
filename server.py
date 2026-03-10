@@ -99,6 +99,7 @@ class CallEndDetector(FrameProcessor):
         self.esl_password = esl_password
         self._pending_hangup = False
         self._hangup_task = None
+        self._task = None  # pipeline task referansı, endpoint'ten set edilecek
 
     async def _hangup_via_esl(self):
         try:
@@ -112,22 +113,23 @@ class CallEndDetector(FrameProcessor):
             await reader.readuntil(b"\n\n")
             writer.close()
             await writer.wait_closed()
-            logger.info(f"📵 [CallEnd] ESL hangup gönderildi.")
+            logger.info("📵 [CallEnd] ESL hangup gönderildi.")
         except Exception as e:
             logger.error(f"ESL hangup hatası: {e}")
 
-    async def _delayed_hangup(self, task: PipelineTask):
-        """TTS bittikten sonra 2 saniye bekle, iptal gelmezse kapat."""
+    async def _delayed_hangup(self):
         try:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
             if self._pending_hangup:
-                logger.info("📵 [CallEnd] Bekleme süresi doldu, kapatılıyor.")
+                logger.info("📵 [CallEnd] Timer doldu, kapatılıyor.")
                 await self._hangup_via_esl()
-                await task.queue_frame(EndFrame())
+                if self._task:
+                    await self._task.queue_frame(EndFrame())
         except asyncio.CancelledError:
             logger.info("📵 [CallEnd] Hangup iptal edildi.")
         finally:
             self._pending_hangup = False
+            self._hangup_task = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -135,29 +137,30 @@ class CallEndDetector(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.lower().strip()
 
-            # Kullanıcı "dur/devam et" dedi — hangup iptal
-            if self._pending_hangup and any(kw in text for kw in CANCEL_KEYWORDS):
-                logger.info("📵 [CallEnd] Kullanıcı iptal etti, devam ediliyor.")
-                self._pending_hangup = False
-                if self._hangup_task:
-                    self._hangup_task.cancel()
-                    self._hangup_task = None
-                await self.push_frame(frame, direction)
+            # pending_hangup varken — sadece iptal kontrolü yap, başka hiçbir şey tetikleme
+            if self._pending_hangup:
+                if any(kw in text for kw in CANCEL_KEYWORDS):
+                    logger.info("📵 [CallEnd] Kullanıcı iptal etti.")
+                    self._pending_hangup = False
+                    if self._hangup_task:
+                        self._hangup_task.cancel()
+                        self._hangup_task = None
+                    await self.push_frame(frame, direction)
+                else:
+                    # Veda veya başka kelime — timer zaten çalışıyor, frame'i yut
+                    logger.debug(f"📵 [CallEnd] Hangup beklenirken yeni transcript yutuldu: '{text}'")
                 return
 
-            # Kapatma kelimesi algılandı
+            # Normal akış — kapatma kelimesi kontrolü
             if any(kw in text for kw in HANGUP_KEYWORDS):
                 logger.info(f"📵 [CallEnd] Kapatma algılandı: '{frame.text}'")
                 self._pending_hangup = True
-                # LLM'e veda cümlesi söylet
                 veda = LLMMessagesUpdateFrame(
                     messages=[{
                         "role": "user",
                         "content": (
                             "Kullanıcı görüşmeyi bitirmek istiyor. "
-                            "Tek cümleyle nazikçe veda et ve 'görüşmek üzere' veya "
-                            "'iyi günler dilerim' gibi bir kapanış yap. "
-                            "Sonra sistem otomatik kapatacak."
+                            "Tek cümleyle nazikçe veda et. Kısa tut."
                         )
                     }],
                     run_llm=True
@@ -168,23 +171,10 @@ class CallEndDetector(FrameProcessor):
         # TTS bitti + hangup bekliyorsa timer başlat
         if isinstance(frame, TTSStoppedFrame) and self._pending_hangup:
             if not self._hangup_task or self._hangup_task.done():
-                # task referansına ihtiyacımız var, FrameProcessor'dan alalım
-                self._hangup_task = asyncio.create_task(
-                    self._delayed_hangup_simple()
-                )
+                logger.info("📵 [CallEnd] TTS bitti, hangup timer başlıyor (1.5s).")
+                self._hangup_task = asyncio.create_task(self._delayed_hangup())
 
         await self.push_frame(frame, direction)
-
-    async def _delayed_hangup_simple(self):
-        try:
-            await asyncio.sleep(2.0)
-            if self._pending_hangup:
-                await self._hangup_via_esl()
-                await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._pending_hangup = False
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
@@ -290,7 +280,7 @@ def service_factory(config: dict):
                 frequency_penalty=0.0,
                 presence_penalty=0.0,
                 # Türkçe için ekstra optimizasyon
-                system_instruction="sayıları her zaman yazı ile türet yirmi beş gibi",
+                system_instruction="sayıları her zaman yazı ile türet yirmi beş gibi. Cümle başlangıcında ingilizce ile karıştırılabilecek kelimeleri kullanma örneğin Size nasıl yardımcı olabilirim? burda size ingilizce kelime ile karıştırılabilir. Cümlenin ilk kelimesi sadece Türkçede olan kelimeler olsun.",
                 # Diğer ayarlar (isteğe bağlı)
                 seed=42,                              # tekrarlanabilirlik için
                 extra={"response_format": {"type": "text"}}  # sadece metin
@@ -320,9 +310,14 @@ def service_factory(config: dict):
             sample_rate=8000,
             model=config.get("tts_model", "sonic-multilingual"),
             language=Language.TR,
-            speed=0.92,
-            emotion="cheerful",
-			text_aggregation_mode=TextAggregationMode.SENTENCE
+            settings=CartesiaTTSSettings(
+                generation_config={
+                    speed=0.92,
+                    emotion="cheerful"
+                },    
+                pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
+            ),
+            text_aggregation_mode=TextAggregationMode.SENTENCE
             # text_aggregation_mode=TextAggregationMode.TOKEN     # düşük latency istersen
         )
     elif tts_provider == "elevenlabs":
@@ -357,7 +352,9 @@ class FillerWordInjector(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             filler = self._next_phrase()
             logger.debug(f"💬 [Dolgu]: '{filler}'")
+            # Dolguyu önce gönder
             await self.push_frame(TextFrame(text=filler), direction)
+        # TranscriptionFrame'i HER ZAMAN downstream'e geçir
         await self.push_frame(frame, direction)
 
 
@@ -367,26 +364,31 @@ class BotSpeakingState:
         self.is_speaking = False
 
 
-# --- UPSTREAM SUPPRESSOR (AEC) ---
-class SoftwareEchoSuppressor(FrameProcessor):
+class InstantBargeInHandler(FrameProcessor):
     def __init__(self, state: BotSpeakingState):
         super().__init__()
         self.state = state
-        self._consecutive_speech_frames = 0
-        self._barge_in_threshold = 5  # ~600ms @ 8000Hz/320byte chunks
+        self._consecutive_frames = 0
+        self._threshold = 5  # ~200ms
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, InputAudioRawFrame) and self.state.is_speaking:
-            self._consecutive_speech_frames += 1
-            # Kısa ses gelirse (eko/yansıma) drop et
-            # Uzun ve sürekli ses gelirse (gerçek barge-in) geçir
-            if self._consecutive_speech_frames < self._barge_in_threshold:
-                return
-        else:
-            if not self.state.is_speaking:
-                self._consecutive_speech_frames = 0
+        if isinstance(frame, InputAudioRawFrame):
+            if self.state.is_speaking:
+                self._consecutive_frames += 1
+                if self._consecutive_frames >= self._threshold:
+                    # Gerçek barge-in: interrupt gönder, mikrofonu aç
+                    logger.info("⚡ [BARGE-IN] Gerçek interrupt, TTS kesiliyor.")
+                    self.state.is_speaking = False
+                    self._consecutive_frames = 0
+                    await self.push_frame(InterruptionFrame(), direction)
+                else:
+                    # Henüz threshold dolmadı, eko olabilir — geçir ama say
+                    await self.push_frame(frame, direction)
+                    return
+            else:
+                self._consecutive_frames = 0
 
         await self.push_frame(frame, direction)
 
@@ -502,7 +504,6 @@ class LLMLogger(FrameProcessor):
             logger.debug(f"🧠 [LLM token]: {frame.text}")
         await self.push_frame(frame, direction)
 
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -520,31 +521,32 @@ async def websocket_endpoint(websocket: WebSocket):
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
     bot_state = BotSpeakingState()
-    echo_suppressor = SoftwareEchoSuppressor(bot_state)
+    barge_in_handler = InstantBargeInHandler(bot_state)  # SoftwareEchoSuppressor + FastBargeInHandler birleşti
     bot_tracker = BotSpeakingTracker(bot_state)
     fs_input = FreeSWITCHInputProcessor(websocket)
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
-    filler_injector =  FillerWordInjector(TR_FILLER_PHRASES)
-    
+    filler_injector = FillerWordInjector(TR_FILLER_PHRASES)
+
     call_end_detector = CallEndDetector(
         call_id=call_id,
         esl_host=FS_HOST,
         esl_port=FS_ESL_PORT,
         esl_password=FS_ESL_PASSWORD
     )
+
     pipeline = Pipeline([
         fs_input,
-        echo_suppressor,
+        barge_in_handler,           # echo_suppressor + barge-in birleşik
         stt,
         stt_logger,
-		call_end_detector,
+        call_end_detector,          # kapatma kelimesi kontrolü
         context_aggregator_pair.user(),
         llm,
         llm_logger,
-        filler_injector,    # LLM'in ilk tokeni gelince dolgu kelimesi TTS'e gider
-        tts,                # Cartesia SENTENCE modunda çalışıyor, ayrıca buffer gerekmez
+        filler_injector,
+        tts,
         bot_tracker,
         fs_output,
         context_aggregator_pair.assistant()
@@ -552,14 +554,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     runner = PipelineRunner()
     task = PipelineTask(pipeline)
+    call_end_detector._task = task  # task referansını ver, delayed_hangup içinde kullanılacak
 
-    # Cold start kaldırıldı — system_prompt yeterli, ajan kullanıcıyı bekler
     async def run_pipeline():
-        await runner.run(task)  # ← burası mutlaka 4 boşluk girintili olmalı
-	
+        await runner.run(task)
+
     async def warmup_tts():
         await asyncio.sleep(1.0)
-        await task.queue_frame(TextFrame(text=" ")) 
+        await task.queue_frame(TextFrame(text=" "))
         logger.info("🔥 TTS warm-up frame gönderildi.")
 
     logger.info("Pipeline başlatılıyor...")
