@@ -198,7 +198,7 @@ class DownsampleTTS(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSAudioRawFrame):
             # ElevenLabs default 22050 Hz varsayalım (repo'da default)
-            downsampled = self._downsample(frame.audio, 22050)
+            downsampled = self._downsample(frame.audio, frame.sample_rate)
             new_frame = TTSAudioRawFrame(
                 audio=downsampled,
                 sample_rate=self.target_rate,
@@ -467,7 +467,6 @@ def service_factory(config: dict):
             settings=ElevenLabsTTSSettings(
                 model=config.get("tts_model") or "eleven_turbo_v2_5",
 			    voice=config.get("tts_voice_id") or "21m00Tcm4TlvDq8ikWAM",
-			    language=Language.TR,
 			    stability=0.5,
 			    similarity_boost=0.75,
 			    style=0.0,
