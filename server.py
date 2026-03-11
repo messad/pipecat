@@ -179,16 +179,18 @@ class CallEndDetector(FrameProcessor):
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
-        # kwargs kaldir, positional ver
-        self.processor = AudioProcessor(3, 2)  # auto_gain_dbfs=3 (hafif adaptive gain), noise_suppression_level=2 (moderate-aggressive)
+        self.processor = AudioProcessor(3, 2)  # auto_gain_dbfs=3, noise_suppression_level=2
         self._calibrated = False
         self._user_rms_sum = 0.0
         self._user_frame_count = 0
         self._dynamic_min_volume = 0.35
 
+        # 8000 Hz için 10ms chunk boyutu (16-bit mono = 2 byte/sample)
+        self.chunk_size_bytes = 160  # 8000 Hz * 0.01 sn * 2 byte
+
     def _rms(self, audio: bytes) -> float:
         try:
-            return audioop.rms(audio, 2) / 32768.0  # normalize 0-1
+            return audioop.rms(audio, 2) / 32768.0
         except:
             return 0.0
 
@@ -196,23 +198,34 @@ class AudioPreProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
-            # webrtc-noise-gain AudioProcessor bytes bekliyor, chunk'ları işle
-            processed_bytes = self.processor.process(frame.audio)  # direkt bytes döner
+            audio_bytes = frame.audio
+            processed_chunks = bytearray()  # temizlenmiş chunk'ları topla
 
-            # Dinamik kalibrasyon (temizlenmiş audio ile)
-            if not self._calibrated:
-                rms = self._rms(processed_bytes)
-                if rms > 0.05:  # anlamlı ses geldi
-                    self._user_rms_sum += rms
-                    self._user_frame_count += 1
-                    if self._user_frame_count >= 8:  # ~250ms yeter
-                        avg_rms = self._user_rms_sum / self._user_frame_count
-                        self._dynamic_min_volume = max(0.18, avg_rms * 0.65)
-                        self._calibrated = True
-                        logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
+            # Audio'yu 10ms chunk'lara böl (160 byte)
+            for i in range(0, len(audio_bytes), self.chunk_size_bytes):
+                chunk = audio_bytes[i:i + self.chunk_size_bytes]
+
+                if len(chunk) == self.chunk_size_bytes:
+                    result = self.processor.Process10ms(chunk)
+                    processed_chunks.extend(result.audio)  # temizlenmiş audio bytes'ı ekle
+
+                    # Dinamik kalibrasyon (ilk anlamlı chunk'ta)
+                    if not self._calibrated:
+                        rms = self._rms(result.audio)
+                        if rms > 0.05:
+                            self._user_rms_sum += rms
+                            self._user_frame_count += 1
+                            if self._user_frame_count >= 8:
+                                avg_rms = self._user_rms_sum / self._user_frame_count
+                                self._dynamic_min_volume = max(0.18, avg_rms * 0.65)
+                                self._calibrated = True
+                                logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
+                else:
+                    # Kalan eksik chunk'ı olduğu gibi ekle (nadir)
+                    processed_chunks.extend(chunk)
 
             new_frame = InputAudioRawFrame(
-                audio=processed_bytes,
+                audio=bytes(processed_chunks),
                 sample_rate=frame.sample_rate,
                 num_channels=frame.num_channels
             )
