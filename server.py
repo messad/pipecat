@@ -181,10 +181,10 @@ class CallEndDetector(FrameProcessor):
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
-        self.processor = AudioProcessor(3, 2)  # auto_gain=3, ns_level=2
+        self.processor = AudioProcessor(3, 2)  # auto_gain_dbfs=3, noise_suppression_level=2
         self.input_rate = 8000
         self.target_rate = 16000
-        self.chunk_size_16k = 320  # fixed 320 bytes @ 16kHz
+        self.chunk_size_16k = 320  # sabit 320 byte (10ms @ 16kHz mono 16-bit)
         self._calibrated = False
         self._user_rms_sum = 0.0
         self._user_frame_count = 0
@@ -192,69 +192,98 @@ class AudioPreProcessor(FrameProcessor):
 
     def _rms(self, audio: bytes) -> float:
         try:
-            return audioop.rms(audio, 2) / 32768.0
-        except:
+            rms = audioop.rms(audio, 2)
+            return rms / 32768.0 if rms > 0 else 0.0
+        except Exception:
             return 0.0
 
     def _resample_up(self, audio_bytes: bytes) -> bytes:
-        # 8000Hz -> 16kHz upsample
+        if not audio_bytes:
+            return b''
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
         num_samples = len(audio_np)
-        new_num_samples = int(num_samples * self.target_rate / self.input_rate)
+        new_num_samples = int(num_samples * (self.target_rate / self.input_rate))
+        if new_num_samples <= 0:
+            return b''
         resampled = resample(audio_np, new_num_samples)
         return resampled.astype(np.int16).tobytes()
 
     def _resample_down(self, audio_bytes: bytes) -> bytes:
-        # 16kHz -> 8000Hz downsample
+        if not audio_bytes:
+            return b''
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
         num_samples = len(audio_np)
-        new_num_samples = int(num_samples * self.input_rate / self.target_rate)
+        new_num_samples = int(num_samples * (self.input_rate / self.target_rate))
+        if new_num_samples <= 0:
+            return b''
         resampled = resample(audio_np, new_num_samples)
         return resampled.astype(np.int16).tobytes()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, InputAudioRawFrame):
-            # Up-sample to 16kHz
-            upsampled = self._resample_up(frame.audio)
-
-            processed_chunks = bytearray()
-
-            for i in range(0, len(upsampled), self.chunk_size_16k):
-                chunk = upsampled[i:i + self.chunk_size_16k]
-
-                if len(chunk) == self.chunk_size_16k:
-                    result = self.processor.Process10ms(chunk)
-                    processed_chunks.extend(result.audio)
-                else:
-                    # Eksik chunk'ı passthrough (downsample öncesi)
-                    processed_chunks.extend(chunk)
-
-            # Down-sample geri 8000Hz'e
-            downsampled = self._resample_down(bytes(processed_chunks))
-
-            # Kalibrasyon (downsampled ile yap)
-            if not self._calibrated:
-                rms = self._rms(downsampled)
-                if rms > 0.05:
-                    self._user_rms_sum += rms
-                    self._user_frame_count += 1
-                    if self._user_frame_count >= 8:
-                        avg_rms = self._user_rms_sum / self._user_frame_count
-                        self._dynamic_min_volume = max(0.18, avg_rms * 0.65)
-                        self._calibrated = True
-                        logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
-
-            new_frame = InputAudioRawFrame(
-                audio=downsampled,
-                sample_rate=self.input_rate,
-                num_channels=frame.num_channels
-            )
-            await self.push_frame(new_frame, direction)
+        if not isinstance(frame, InputAudioRawFrame):
+            await self.push_frame(frame, direction)
             return
 
-        await self.push_frame(frame, direction)
+        audio_bytes = frame.audio
+        if not audio_bytes:
+            await self.push_frame(frame, direction)
+            return
+
+        # 1. 8000Hz → 16kHz upsample
+        upsampled = self._resample_up(audio_bytes)
+
+        processed_chunks = bytearray()
+
+        i = 0
+        while i < len(upsampled):
+            remaining = len(upsampled) - i
+            if remaining >= self.chunk_size_16k:
+                chunk = upsampled[i:i + self.chunk_size_16k]
+                try:
+                    result = self.processor.Process10ms(chunk)
+                    processed_chunks.extend(result.audio)
+                except Exception as e:
+                    logger.warning(f"Process10ms hatası: {e}, chunk atlanıyor")
+                    processed_chunks.extend(chunk)  # hata olursa passthrough
+                i += self.chunk_size_16k
+            else:
+                # Kalan küçük chunk'ı pad'le ve işle
+                pad_size = self.chunk_size_16k - remaining
+                padded_chunk = upsampled[i:] + b'\x00' * pad_size
+                try:
+                    result = self.processor.Process10ms(padded_chunk)
+                    processed_chunks.extend(result.audio[:remaining])  # sadece orijinal uzunluk
+                except Exception as e:
+                    logger.warning(f"Padlanmış Process10ms hatası: {e}, kalan passthrough")
+                    processed_chunks.extend(upsampled[i:])
+                i += remaining
+
+        # 2. Temizlenmiş 16kHz → 8000Hz downsample
+        downsampled = self._resample_down(bytes(processed_chunks))
+
+        # 3. Kalibrasyon (temizlenmiş 8000Hz audio ile)
+        if not self._calibrated:
+            rms = self._rms(downsampled)
+            if rms > 0.05:
+                self._user_rms_sum += rms
+                self._user_frame_count += 1
+                if self._user_frame_count >= 8:
+                    avg_rms = self._user_rms_sum / self._user_frame_count
+                    self._dynamic_min_volume = max(0.18, avg_rms * 0.65)
+                    self._calibrated = True
+                    logger.info(f"🎯 [CALIBRATION] Kullanıcı RMS ortalaması: {avg_rms:.3f} → min_volume={self._dynamic_min_volume:.3f}")
+                    self._user_rms_sum = 0.0  # sıfırla
+                    self._user_frame_count = 0
+
+        # 4. Yeni frame'i downstream'e gönder
+        new_frame = InputAudioRawFrame(
+            audio=downsampled,
+            sample_rate=self.input_rate,
+            num_channels=frame.num_channels
+        )
+        await self.push_frame(new_frame, direction)
 
 class OutboundCallRequest(BaseModel):
     phone_number: str
