@@ -178,6 +178,36 @@ class CallEndDetector(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+class DownsampleTTS(FrameProcessor):
+    def __init__(self, target_rate=8000):
+        super().__init__()
+        self.target_rate = target_rate
+
+    def _downsample(self, audio_bytes: bytes, current_rate: int) -> bytes:
+        if current_rate == self.target_rate:
+            return audio_bytes
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        num_samples = len(audio_np)
+        new_num_samples = int(num_samples * self.target_rate / current_rate)
+        if new_num_samples <= 0:
+            return audio_bytes
+        resampled = resample(audio_np, new_num_samples)
+        return resampled.astype(np.int16).tobytes()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TTSAudioRawFrame):
+            # ElevenLabs default 22050 Hz varsayalım (repo'da default)
+            downsampled = self._downsample(frame.audio, 22050)
+            new_frame = TTSAudioRawFrame(
+                audio=downsampled,
+                sample_rate=self.target_rate,
+                num_channels=frame.num_channels
+            )
+            await self.push_frame(new_frame, direction)
+            return
+        await self.push_frame(frame, direction)
+
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
@@ -608,7 +638,7 @@ async def websocket_endpoint(websocket: WebSocket):
     )
     audio_preprocessor = AudioPreProcessor()
     force_interrupt = ForceInterrupt()
-	
+    downsample_tts =DownsampleTTS(target_rate=8000)	
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor, 
@@ -621,6 +651,7 @@ async def websocket_endpoint(websocket: WebSocket):
         llm_logger,
         #filler_injector,
         tts,
+        downsample_tts,
         fs_output,
         context_aggregator_pair.assistant()
     ])
