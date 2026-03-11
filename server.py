@@ -352,11 +352,11 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.25,
-            start_secs=0.08,
+            stop_secs=0.12,
+            start_secs=0.04,
             min_volume=0.18,
-            confidence=0.6,
-            min_speech_duration_ms=80
+            confidence=0.5,
+            min_speech_duration_ms=40
         )
     )
 
@@ -366,8 +366,8 @@ def service_factory(config: dict):
             VADUserTurnStartStrategy(
                 vad_analyzer=vad_analyzer,
                 enable_interruptions=True,
-                min_audio_duration_to_interrupt=0.15,  # ms değil sn, düşük tut
-                min_words_to_interrupt=2,
+                min_audio_duration_to_interrupt=0.04,  # ms değil sn, düşük tut
+                min_words_to_interrupt=0
             )
         ]
         # stop stratejisi istersen ekleyebilirsin, default akıllı
@@ -552,6 +552,14 @@ class LLMLogger(FrameProcessor):
             logger.debug(f"🧠 [LLM token]: {frame.text}")
         await self.push_frame(frame, direction)
 
+class ForceInterrupt(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuştu, TTS zorla kesiliyor!")
+            await self.push_frame(InterruptionFrame(), direction)
+        await self.push_frame(frame, direction)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -586,13 +594,14 @@ async def websocket_endpoint(websocket: WebSocket):
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor, 
+        force_interrupt,
         stt,
         stt_logger,
         call_end_detector,
         context_aggregator_pair.user(),  # user turn stratejileri burada aktif
         llm,
         llm_logger,
-        filler_injector,
+        #filler_injector,
         tts,
         fs_output,
         context_aggregator_pair.assistant()
