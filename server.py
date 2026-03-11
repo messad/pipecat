@@ -437,7 +437,7 @@ def service_factory(config: dict):
             settings=ElevenLabsTTSSettings(
                 model=config.get("tts_model") or "eleven_turbo_v2_5",
 			    voice=config.get("tts_voice_id") or "21m00Tcm4TlvDq8ikWAM",
-			    language=Language.TR if config.get("tts_language", "tr") == "tr" else None,
+			    language=Language.TR,
 			    stability=0.5,
 			    similarity_boost=0.75,
 			    style=0.0,
