@@ -595,7 +595,7 @@ async def websocket_endpoint(websocket: WebSocket):
         esl_password=FS_ESL_PASSWORD
     )
     audio_preprocessor = AudioPreProcessor()
-	force_interrupt = ForceInterrupt()
+    force_interrupt = ForceInterrupt()
 	
     pipeline = Pipeline([
         fs_input,
