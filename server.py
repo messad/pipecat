@@ -553,11 +553,16 @@ class LLMLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 class ForceInterrupt(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuştu, TTS zorla kesiliyor!")
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS anında kesiliyor!")
             await self.push_frame(InterruptionFrame(), direction)
+        
         await self.push_frame(frame, direction)
 
 
@@ -590,6 +595,7 @@ async def websocket_endpoint(websocket: WebSocket):
         esl_password=FS_ESL_PASSWORD
     )
     audio_preprocessor = AudioPreProcessor()
+	force_interrupt = ForceInterrupt()
 	
     pipeline = Pipeline([
         fs_input,
