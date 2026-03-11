@@ -443,7 +443,7 @@ def service_factory(config: dict):
 			    style=0.0,
 			    use_speaker_boost=True,
 			    speed=1.0,
-                output_format="mulaw_8000"
+                output_format="mulaw_8000",
 				apply_text_normalization="auto"     
             ),
             text_aggregation_mode=TextAggregationMode.TOKEN
