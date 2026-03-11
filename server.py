@@ -438,13 +438,12 @@ def service_factory(config: dict):
                 model=config.get("tts_model") or "eleven_turbo_v2_5",
 			    voice=config.get("tts_voice_id") or "21m00Tcm4TlvDq8ikWAM",
 			    language=Language.TR if config.get("tts_language", "tr") == "tr" else None,
-			    optimize_streaming_latency=1,
 			    stability=0.5,
 			    similarity_boost=0.75,
 			    style=0.0,
 			    use_speaker_boost=True,
 			    speed=1.0,
-			    sample_rate=8000,
+                output_format="mulaw_8000"
 				apply_text_normalization="auto"     
             ),
             text_aggregation_mode=TextAggregationMode.TOKEN
