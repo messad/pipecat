@@ -30,7 +30,7 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.anthropic.llm import AnthropicLLMService
-from pipecat.services.groq import GroqLLMService
+from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.cartesia.tts import CartesiaTTSService, TextAggregationMode, CartesiaTTSSettings, GenerationConfig
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
@@ -384,11 +384,11 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.12,
-            start_secs=0.04,
+            stop_secs=0.05,
+            start_secs=0.12,
             min_volume=0.18,
-            confidence=0.5,
-            min_speech_duration_ms=40
+            confidence=0.6,
+            min_speech_duration_ms=100
         )
     )
 
@@ -424,7 +424,7 @@ def service_factory(config: dict):
                 max_tokens=512,
                 frequency_penalty=0.0,
                 presence_penalty=0.0,
-                system_instruction="sayıları her zaman yazı ile türet yirmi beş gibi. Cümle başlangıcında ingilizce ile karıştırılabilecek kelimeleri kullanma örneğin Size nasıl yardımcı olabilirim? burda size ingilizce kelime ile karıştırılabilir. Cümlenin ilk kelimesi sadece Türkçede olan kelimeler olsun.",
+                system_instruction="Prompt KESİNLİKLE sadece ve sadece Türkçe kelimelerden oluşsun. İlk mesajı kısa tut, gecikmeyi maskele. Sayıları her zaman yazı ile türet yirmi beş gibi. ",
                 seed=42,
                 extra={"response_format": {"type": "text"}}
             )
@@ -438,9 +438,17 @@ def service_factory(config: dict):
     elif llm_provider == "groq":
         llm = GroqLLMService(
             api_key=os.getenv("GROQ_API_KEY"),
-            model=config.get("llm_model", "llama-3.3-70b-versatile"),
-            temperature=0.7,
-            top_p=0.9
+            settings=GroqLLMSettings(
+                model=config.get("llm_model", "llama-3.3-70b-versatile"),
+                temperature=0.7,
+                top_p=0.9,
+                max_tokens=512,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                system_instruction="Prompt KESİNLİKLE sadece ve sadece Türkçe kelimelerden oluşsun.İlk mesajı kısa tut, gecikmeyi maskele. Sayıları her zaman yazı ile türet yirmi beş gibi. ",
+                seed=42,
+                extra={"response_format": {"type": "text"}}
+            )
         )
     else:
         raise ValueError(f"Desteklenmeyen LLM provider: {llm_provider}")
@@ -602,8 +610,15 @@ class ForceInterrupt(FrameProcessor):
         await super().process_frame(frame, direction)
         
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS anında kesiliyor!")
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS ve LLM iptal ediliyor!")
+            # 1. InterruptionFrame gönder (zaten var)
             await self.push_frame(InterruptionFrame(), direction)
+            
+            # 2. TTS ve LLM'i zorla iptal et (buffer temizliği için)
+            await self.push_frame(CancelFrame(), direction)
+            
+            # 3. Opsiyonel: TTSStoppedFrame zorla yolla (bazı TTS servisleri bunu bekler)
+            await self.push_frame(TTSStoppedFrame(), direction)
         
         await self.push_frame(frame, direction)
 
