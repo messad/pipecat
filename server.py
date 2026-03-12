@@ -332,7 +332,7 @@ class OutboundCallRequest(BaseModel):
     tts_provider: Optional[str] = "cartesia"
     tts_model: Optional[str] = "sonic-multilingual"
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
-    tss_dictionary: Optional[str] = "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
+    tts_dictionary: Optional[str] = "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
 
 
 async def esl_originate(originate_cmd: str) -> str:
@@ -458,7 +458,7 @@ def service_factory(config: dict):
                     speed=0.92,
                     emotion="cheerful"
                 ),    
-                pronunciation_dict_id=config.get("tss_dictionary") or "pdict_w1PUAkiAVRCQpXe3o9SQTv",// google hesabı "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
+                pronunciation_dict_id=config.get("tts_dictionary") or "pdict_w1PUAkiAVRCQpXe3o9SQTv" # google hesabı "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
             #text_aggregation_mode=TextAggregationMode.SENTENCE,
             text_aggregation_mode=TextAggregationMode.TOKEN
