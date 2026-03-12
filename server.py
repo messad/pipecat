@@ -526,38 +526,42 @@ class FreeSWITCHInputProcessor(FrameProcessor):
 
 
 class WebSocketOutput(FrameProcessor):
-    def __init__(self, websocket: WebSocket):
+    def __init__(self, websocket: WebSocket, call_id: str):
         super().__init__()
         self.websocket = websocket
+        self.call_id = call_id
         self._log_counter = 0
         self._muted = False
 
-    async def _send_silence(self, duration_ms: int = 500):
-        chunk_ms = 20
-        chunks = duration_ms // chunk_ms
-        silence = b'\x00' * int(8000 * 2 * chunk_ms / 1000)
-        for _ in range(chunks):
-            try:
-                payload = json.dumps({
-                    "type": "streamAudio",
-                    "data": {
-                        "audioDataType": "raw",
-                        "sampleRate": 8000,
-                        "audioData": base64.b64encode(silence).decode("utf-8")
-                    }
-                })
-                await self.websocket.send_text(payload)
-                await asyncio.sleep(chunk_ms / 1000)
-            except Exception:
-                break
+    async def _stop_stream(self):
+        """FreeSWITCH'e stream'i durdur komutu gönder."""
+        try:
+            reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
+            await reader.readuntil(b"auth/request\n\n")
+            writer.write(f"auth {FS_ESL_PASSWORD}\n\n".encode())
+            await writer.drain()
+            await reader.readuntil(b"\n\n")
+            writer.write(f"api uuid_audio_stream {self.call_id} stop\n\n".encode())
+            await writer.drain()
+            await reader.readuntil(b"\n\n")
+            # Hemen yeniden başlat ki kullanıcı sesi gelmeye devam etsin
+            ws_url = f"{PIPECAT_WS_BASE}/ws?call_id={self.call_id}"
+            writer.write(f"api uuid_audio_stream {self.call_id} start {ws_url} mono 8000\n\n".encode())
+            await writer.drain()
+            await reader.readuntil(b"\n\n")
+            writer.close()
+            await writer.wait_closed()
+            logger.info("🔇 [OUTPUT] Stream sıfırlandı.")
+        except Exception as e:
+            logger.error(f"Stream sıfırlama hatası: {e}")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InterruptionFrame):
             self._muted = True
-            logger.info("🔇 [OUTPUT] Interrupt alındı, sessizlik gönderiliyor.")
-            asyncio.create_task(self._send_silence(500))
+            logger.info("🔇 [OUTPUT] Interrupt, ses kesildi.")
+            asyncio.create_task(self._stop_stream())
 
         elif isinstance(frame, TTSStartedFrame):
             self._muted = False
@@ -635,7 +639,7 @@ async def websocket_endpoint(websocket: WebSocket):
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
     fs_input = FreeSWITCHInputProcessor(websocket)
-    fs_output = WebSocketOutput(websocket)
+    fs_output = WebSocketOutput(websocket, call_id=call_id)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
     filler_injector = FillerWordInjector(TR_FILLER_PHRASES)
