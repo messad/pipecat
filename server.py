@@ -334,6 +334,21 @@ class OutboundCallRequest(BaseModel):
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
     tts_dictionary: Optional[str] = "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
 
+class TTSBufferClear(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        
+        if isinstance(frame, TTSAudioRawFrame):
+            # Kalan audio chunk'larını yut (sessiz frame gönder)
+            silent_frame = TTSAudioRawFrame(
+                audio=b'\x00' * len(frame.audio),  # sessiz
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels
+            )
+            await self.push_frame(silent_frame, direction)
+            return  # orijinal frame'i yut
+        
+        await self.push_frame(frame, direction)
 
 async def esl_originate(originate_cmd: str) -> str:
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
@@ -468,8 +483,8 @@ def service_factory(config: dict):
                 ),    
                 pronunciation_dict_id=config.get("tts_dictionary") or "pdict_w1PUAkiAVRCQpXe3o9SQTv" # google hesabı "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
-            #text_aggregation_mode=TextAggregationMode.SENTENCE,
-            text_aggregation_mode=TextAggregationMode.TOKEN
+            text_aggregation_mode=TextAggregationMode.SENTENCE
+            #text_aggregation_mode=TextAggregationMode.TOKEN
         )
     elif tts_provider == "elevenlabs":
         tts = ElevenLabsTTSService(
@@ -648,6 +663,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_preprocessor = AudioPreProcessor()
     force_interrupt = ForceInterrupt()
     downsample_tts =DownsampleTTS(target_rate=8000)	
+	tts_buffer_clear = TTSBufferClear()
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor, 
@@ -660,6 +676,7 @@ async def websocket_endpoint(websocket: WebSocket):
         llm_logger,
         #filler_injector,
         tts,
+		tts_buffer_clear,
         downsample_tts,
         fs_output,
         context_aggregator_pair.assistant()
