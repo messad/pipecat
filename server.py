@@ -179,36 +179,6 @@ class CallEndDetector(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
-class DownsampleTTS(FrameProcessor):
-    def __init__(self, target_rate=8000):
-        super().__init__()
-        self.target_rate = target_rate
-
-    def _downsample(self, audio_bytes: bytes, current_rate: int) -> bytes:
-        if current_rate == self.target_rate:
-            return audio_bytes
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-        num_samples = len(audio_np)
-        new_num_samples = int(num_samples * self.target_rate / current_rate)
-        if new_num_samples <= 0:
-            return audio_bytes
-        resampled = resample(audio_np, new_num_samples)
-        return resampled.astype(np.int16).tobytes()
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TTSAudioRawFrame):
-            # ElevenLabs default 22050 Hz varsayalım (repo'da default)
-            downsampled = self._downsample(frame.audio, frame.sample_rate)
-            new_frame = TTSAudioRawFrame(
-                audio=downsampled,
-                sample_rate=self.target_rate,
-                num_channels=frame.num_channels
-            )
-            await self.push_frame(new_frame, direction)
-            return
-        await self.push_frame(frame, direction)
-
 class AudioPreProcessor(FrameProcessor):
     def __init__(self):
         super().__init__()
@@ -334,22 +304,6 @@ class OutboundCallRequest(BaseModel):
     tts_voice_id: Optional[str] = "39f753ef-b0eb-41cd-aa53-2f3c284f948f"
     tts_dictionary: Optional[str] = "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
 
-class TTSBufferClear(FrameProcessor):
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        
-        if isinstance(frame, TTSAudioRawFrame):
-            # Kalan audio chunk'larını yut (sessiz frame gönder)
-            silent_frame = TTSAudioRawFrame(
-                audio=b'\x00' * len(frame.audio),  # sessiz
-                sample_rate=frame.sample_rate,
-                num_channels=frame.num_channels
-            )
-            await self.push_frame(silent_frame, direction)
-            return  # orijinal frame'i yut
-        
-        await self.push_frame(frame, direction)
-
 async def esl_originate(originate_cmd: str) -> str:
     reader, writer = await asyncio.open_connection(FS_HOST, FS_ESL_PORT)
     try:
@@ -399,11 +353,11 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.05,
-            start_secs=0.12,
-            min_volume=0.18,
-            confidence=0.6,
-            min_speech_duration_ms=100
+            stop_secs=0.25,
+            start_secs=0.18,
+            min_volume=0.2,
+            confidence=0.7,
+            min_speech_duration_ms=120
         )
     )
 
@@ -625,10 +579,10 @@ class ForceInterrupt(FrameProcessor):
         await super().process_frame(frame, direction)
         
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS kesiliyor!")
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuştu, TTS kesiliyor!")
             await self.push_frame(InterruptionFrame(), direction)
-            await self.push_frame(TTSStoppedFrame(), direction)  # kalan buffer'ı zorla bitir
-            
+            await self.push_frame(TTSStoppedFrame(), direction)  # buffer bitir
+        
         await self.push_frame(frame, direction)
 
 
@@ -662,8 +616,6 @@ async def websocket_endpoint(websocket: WebSocket):
     )
     audio_preprocessor = AudioPreProcessor()
     force_interrupt = ForceInterrupt()
-    downsample_tts =DownsampleTTS(target_rate=8000)	
-    tts_buffer_clear = TTSBufferClear()
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor, 
@@ -676,8 +628,6 @@ async def websocket_endpoint(websocket: WebSocket):
         llm_logger,
         #filler_injector,
         tts,
-        tts_buffer_clear,
-        downsample_tts,
         fs_output,
         context_aggregator_pair.assistant()
     ])
