@@ -530,9 +530,32 @@ class WebSocketOutput(FrameProcessor):
         super().__init__()
         self.websocket = websocket
         self._log_counter = 0
+        self._interrupted = False  # VANA: Başlangıçta açık
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        
+        # 1. Araya girildiğinde VANAYI KAPAT
+        if isinstance(frame, (InterruptionFrame, VADUserStartedSpeakingFrame)):
+            self._interrupted = True
+            logger.info("🛑 [WebSocketOutput] Vana KAPATILDI. Borudaki bayat ses paketleri çöpe atılıyor.")
+            await self.push_frame(frame, direction)
+            return
+            
+        # 2. Asistan yeni bir cevap vermeye başladığında VANAYI TEKRAR AÇ
+        if isinstance(frame, TTSStartedFrame):
+            self._interrupted = False
+            logger.info("▶️ [WebSocketOutput] Vana AÇILDI. Yeni ses akışı başlatıldı.")
+            await self.push_frame(frame, direction)
+            return
+
+        # 3. Ses paketi geldiğinde kontrol et
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
+            
+            # Eğer vana kapalıysa (araya girildiyse) bu sesleri FreeSWITCH'e GÖNDERME, ÇÖPE AT!
+            if self._interrupted:
+                return
+
             try:
                 payload = json.dumps({
                     "type": "streamAudio",
@@ -549,9 +572,10 @@ class WebSocketOutput(FrameProcessor):
             except Exception as e:
                 err = str(e).lower()
                 if "close" in err or "disconnect" in err or "runtime" in err:
-                    logger.warning("FreeSWITCH bağlantısı kapandı.")
+                    logger.warning("FreeSWITCH bağlantısı kapandı, ses gönderimi durduruldu.")
                 else:
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
+                    
         await self.push_frame(frame, direction)
 
 
