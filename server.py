@@ -626,7 +626,7 @@ async def websocket_endpoint(websocket: WebSocket):
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
     fs_input = FreeSWITCHInputProcessor(websocket)
-    fs_output = WebSocketOutput(websocket, call_id=call_id)
+    fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
     llm_logger = LLMLogger()
     filler_injector = FillerWordInjector(TR_FILLER_PHRASES)
