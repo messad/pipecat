@@ -530,10 +530,41 @@ class WebSocketOutput(FrameProcessor):
         super().__init__()
         self.websocket = websocket
         self._log_counter = 0
+        self._muted = False
+
+    async def _send_silence(self, duration_ms: int = 500):
+        chunk_ms = 20
+        chunks = duration_ms // chunk_ms
+        silence = b'\x00' * int(8000 * 2 * chunk_ms / 1000)
+        for _ in range(chunks):
+            try:
+                payload = json.dumps({
+                    "type": "streamAudio",
+                    "data": {
+                        "audioDataType": "raw",
+                        "sampleRate": 8000,
+                        "audioData": base64.b64encode(silence).decode("utf-8")
+                    }
+                })
+                await self.websocket.send_text(payload)
+                await asyncio.sleep(chunk_ms / 1000)
+            except Exception:
+                break
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
+
+        if isinstance(frame, InterruptionFrame):
+            self._muted = True
+            logger.info("🔇 [OUTPUT] Interrupt alındı, sessizlik gönderiliyor.")
+            asyncio.create_task(self._send_silence(500))
+
+        elif isinstance(frame, TTSStartedFrame):
+            self._muted = False
+
+        elif isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
+            if self._muted:
+                return
             try:
                 payload = json.dumps({
                     "type": "streamAudio",
@@ -553,6 +584,7 @@ class WebSocketOutput(FrameProcessor):
                     logger.warning("FreeSWITCH bağlantısı kapandı.")
                 else:
                     logger.error(f"WebSocket ses gönderme hatası: {e}")
+
         await self.push_frame(frame, direction)
 
 
