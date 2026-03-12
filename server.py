@@ -610,16 +610,10 @@ class ForceInterrupt(FrameProcessor):
         await super().process_frame(frame, direction)
         
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS ve LLM iptal ediliyor!")
-            # 1. InterruptionFrame gönder (zaten var)
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuşmaya başladı, TTS kesiliyor!")
             await self.push_frame(InterruptionFrame(), direction)
+            await self.push_frame(TTSStoppedFrame(), direction)  # kalan buffer'ı zorla bitir
             
-            # 2. TTS ve LLM'i zorla iptal et (buffer temizliği için)
-            await self.push_frame(CancelFrame(), direction)
-            
-            # 3. Opsiyonel: TTSStoppedFrame zorla yolla (bazı TTS servisleri bunu bekler)
-            await self.push_frame(TTSStoppedFrame(), direction)
-        
         await self.push_frame(frame, direction)
 
 
