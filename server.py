@@ -663,7 +663,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_preprocessor = AudioPreProcessor()
     force_interrupt = ForceInterrupt()
     downsample_tts =DownsampleTTS(target_rate=8000)	
-	tts_buffer_clear = TTSBufferClear()
+    tts_buffer_clear = TTSBufferClear()
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor, 
@@ -676,7 +676,7 @@ async def websocket_endpoint(websocket: WebSocket):
         llm_logger,
         #filler_injector,
         tts,
-		tts_buffer_clear,
+        tts_buffer_clear,
         downsample_tts,
         fs_output,
         context_aggregator_pair.assistant()
