@@ -457,7 +457,7 @@ def service_factory(config: dict):
                     speed=0.92,
                     emotion="cheerful"
                 ),    
-                pronunciation_dict_id="pdict_JL3JcmhtjtKd7rkV2Fwt6a"
+                pronunciation_dict_id="pdict_w1PUAkiAVRCQpXe3o9SQTv"// google hesabı "pdict_JL3JcmhtjtKd7rkV2Fwt6a"
             ),
             #text_aggregation_mode=TextAggregationMode.SENTENCE,
             text_aggregation_mode=TextAggregationMode.TOKEN
