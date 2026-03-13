@@ -535,10 +535,17 @@ class WebSocketOutput(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         
-        # 1. Araya girildiğinde VANAYI KAPAT
+        # 1. Araya girildiğinde C++ MODÜLÜNE SİLME KOMUTUNU GÖNDER VE VANAYI KAPAT
         if isinstance(frame, (InterruptionFrame, VADUserStartedSpeakingFrame)):
             self._interrupted = True
-            logger.info("🛑 [WebSocketOutput] Vana KAPATILDI. Borudaki bayat ses paketleri çöpe atılıyor.")
+            logger.info("🛑 [WebSocketOutput] Araya girildi! FreeSWITCH'e 'clearAudio' komutu gönderiliyor...")
+            try:
+                # İŞTE SİHİRLİ KOMUT: C++ tarafındaki CF_BREAK'i tetikler
+                payload = json.dumps({"type": "clearAudio"})
+                await self.websocket.send_text(payload)
+            except Exception as e:
+                logger.error(f"clearAudio gönderme hatası: {e}")
+                
             await self.push_frame(frame, direction)
             return
             
@@ -552,7 +559,7 @@ class WebSocketOutput(FrameProcessor):
         # 3. Ses paketi geldiğinde kontrol et
         if isinstance(frame, (AudioRawFrame, TTSAudioRawFrame, OutputAudioRawFrame)) and not isinstance(frame, InputAudioRawFrame):
             
-            # Eğer vana kapalıysa (araya girildiyse) bu sesleri FreeSWITCH'e GÖNDERME, ÇÖPE AT!
+            # Eğer vana kapalıysa (eski cevabın kalan sesleriyse) FreeSWITCH'e GÖNDERME, ÇÖPE AT!
             if self._interrupted:
                 return
 
@@ -594,45 +601,6 @@ class LLMLogger(FrameProcessor):
             logger.debug(f"🧠 [LLM token]: {frame.text}")
         await self.push_frame(frame, direction)
 
-class ForceInterrupt(FrameProcessor):
-    def __init__(self, call_id: str, esl_host: str, esl_port: int, esl_password: str):
-        super().__init__()
-        self.call_id = call_id
-        self.esl_host = esl_host
-        self.esl_port = esl_port
-        self.esl_password = esl_password
-        self._breaking = False  # eşzamanlı çağrıları önle
-
-    async def _break_audio_via_esl(self):
-        if self._breaking:
-            return
-        self._breaking = True
-        try:
-            reader, writer = await asyncio.open_connection(self.esl_host, self.esl_port)
-            await reader.readuntil(b"auth/request\n\n")
-            writer.write(f"auth {self.esl_password}\n\n".encode())
-            await writer.drain()
-            await reader.readuntil(b"\n\n")
-            writer.write(f"api uuid_break {self.call_id} all\n\n".encode())
-            await writer.drain()
-            await reader.readuntil(b"\n\n")
-            writer.close()
-            await writer.wait_closed()
-            logger.info("🔪 [ForceInterrupt] uuid_break gönderildi.")
-        except Exception as e:
-            logger.error(f"ESL uuid_break hatası: {e}")
-        finally:
-            self._breaking = False
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuştu, TTS kesiliyor!")
-            asyncio.create_task(self._break_audio_via_esl())
-            await self.push_frame(InterruptionFrame(), direction)
-        await self.push_frame(frame, direction)
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -662,16 +630,10 @@ async def websocket_endpoint(websocket: WebSocket):
         esl_password=FS_ESL_PASSWORD
     )
     audio_preprocessor = AudioPreProcessor()
-    force_interrupt = ForceInterrupt(
-        call_id=call_id,
-        esl_host=FS_HOST,
-        esl_port=FS_ESL_PORT,
-        esl_password=FS_ESL_PASSWORD	
-	)
+
     pipeline = Pipeline([
         fs_input,
-        audio_preprocessor, 
-        force_interrupt,
+        audio_preprocessor,
         stt,
         stt_logger,
         call_end_detector,
