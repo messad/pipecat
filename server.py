@@ -353,7 +353,7 @@ def service_factory(config: dict):
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
         params=VADParams(
-            stop_secs=0.25,
+            stop_secs=0.5,
             start_secs=0.18,
             min_volume=0.2,
             confidence=0.7,
@@ -460,6 +460,73 @@ def service_factory(config: dict):
 
     return stt, llm, tts, context_aggregator_pair
 
+class ESLClient:
+    def __init__(self, host: str, port: int, password: str):
+        self.host = host
+        self.port = port
+        self.password = password
+        self._reader = None
+        self._writer = None
+        self._lock = asyncio.Lock()
+
+    async def connect(self):
+        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+        await self._reader.readuntil(b"auth/request\n\n")
+        self._writer.write(f"auth {self.password}\n\n".encode())
+        await self._writer.drain()
+        await self._reader.readuntil(b"\n\n")
+        logger.info("✅ ESL persistent bağlantı kuruldu.")
+
+    async def execute(self, cmd: str):
+        async with self._lock:
+            try:
+                self._writer.write(cmd.encode())
+                await self._writer.drain()
+                await self._reader.readuntil(b"\n\n")
+            except Exception as e:
+                logger.error(f"ESL execute hatası: {e}")
+                try:
+                    await self.connect()
+                except Exception as e2:
+                    logger.error(f"ESL reconnect hatası: {e2}")
+
+    async def close(self):
+        try:
+            if self._writer:
+                self._writer.close()
+                await self._writer.wait_closed()
+        except:
+            pass
+
+
+class ForceInterrupt(FrameProcessor):
+    def __init__(self, call_id: str, esl: ESLClient):
+        super().__init__()
+        self.call_id = call_id
+        self.esl = esl
+        self._breaking = False
+
+    async def _pause_then_resume(self):
+        if self._breaking:
+            return
+        self._breaking = True
+        try:
+            await self.esl.execute(f"api uuid_audio_stream {self.call_id} pause\n\n")
+            logger.info("⏸ [ForceInterrupt] Stream pause edildi.")
+            await asyncio.sleep(0.6)
+            await self.esl.execute(f"api uuid_audio_stream {self.call_id} resume\n\n")
+            logger.info("▶ [ForceInterrupt] Stream resume edildi.")
+        finally:
+            self._breaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            logger.info("⚡ FORCE INTERRUPT: Kullanıcı konuştu, TTS kesiliyor!")
+            asyncio.create_task(self._pause_then_resume())
+            await self.push_frame(InterruptionFrame(), direction)
+        await self.push_frame(frame, direction)
+
 
 class FillerWordInjector(FrameProcessor):
     def __init__(self, phrases: list):
@@ -538,17 +605,10 @@ class WebSocketOutput(FrameProcessor):
         # 1. Araya girildiğinde C++ MODÜLÜNE SİLME KOMUTUNU GÖNDER VE VANAYI KAPAT
         if isinstance(frame, (InterruptionFrame, VADUserStartedSpeakingFrame)):
             self._interrupted = True
-            logger.info("🛑 [WebSocketOutput] Araya girildi! FreeSWITCH'e 'clearAudio' komutu gönderiliyor...")
-            try:
-                # İŞTE SİHİRLİ KOMUT: C++ tarafındaki CF_BREAK'i tetikler
-                payload = json.dumps({"type": "clearAudio"})
-                await self.websocket.send_text(payload)
-            except Exception as e:
-                logger.error(f"clearAudio gönderme hatası: {e}")
-                
+            logger.info("🛑 [WebSocketOutput] Araya girildi, ses vanası kapatıldı.")
             await self.push_frame(frame, direction)
             return
-            
+		  	
         # 2. Asistan yeni bir cevap vermeye başladığında VANAYI TEKRAR AÇ
         if isinstance(frame, TTSStartedFrame):
             self._interrupted = False
@@ -617,6 +677,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt, llm, tts, context_aggregator_pair = service_factory(config)
 
+    esl = ESLClient(FS_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
+    await esl.connect()
+    force_interrupt = ForceInterrupt(call_id=call_id, esl=esl)
+
     fs_input = FreeSWITCHInputProcessor(websocket)
     fs_output = WebSocketOutput(websocket)
     stt_logger = STTLogger()
@@ -634,7 +698,8 @@ async def websocket_endpoint(websocket: WebSocket):
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor,
-        stt,
+        force_interrupt,
+		stt,
         stt_logger,
         call_end_detector,
         context_aggregator_pair.user(),  # user turn stratejileri burada aktif
@@ -665,6 +730,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"Pipeline hatası: {e}")
     finally:
         await fs_input.cleanup()
+        await esl.close()
         if call_id in active_call_configs:
             del active_call_configs[call_id]
             logger.info(f"Config temizlendi. call_id={call_id}")
