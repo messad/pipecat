@@ -698,7 +698,7 @@ async def websocket_endpoint(websocket: WebSocket):
     pipeline = Pipeline([
         fs_input,
         audio_preprocessor,
-        force_interrupt,
+        #force_interrupt,
 		stt,
         stt_logger,
         call_end_detector,
@@ -725,7 +725,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     logger.info("Pipeline başlatılıyor...")
     try:
-        await asyncio.gather(run_pipeline(), warmup_tts())
+        #await asyncio.gather(run_pipeline(), warmup_tts())
     except Exception as e:
         logger.error(f"Pipeline hatası: {e}")
     finally:
