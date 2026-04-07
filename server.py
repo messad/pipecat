@@ -697,7 +697,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     pipeline = Pipeline([
         fs_input,
-        audio_preprocessor,
+        #audio_preprocessor,
         #force_interrupt,
 		stt,
         stt_logger,
