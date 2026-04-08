@@ -67,10 +67,26 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader
+
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
 app = FastAPI()
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+# Kendi belirlediğiniz çok güçlü bir şifre. Bunu .env dosyasından da çekebilirsiniz.
+SECRET_API_KEY = os.getenv("API_KEY", "bunu_kimsenin_tahmin_edemeyecegi_karmasik_bir_anahtar_yapin") 
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == SECRET_API_KEY:
+        return api_key_header
+    raise HTTPException(
+        status_code=403,
+        detail="Yetkisiz Erişim! API Anahtari Gecersiz."
+    )
 
 active_call_configs: Dict[str, Any] = {}
 
@@ -355,7 +371,7 @@ def service_factory(config: dict):
         params=VADParams(
             stop_secs=0.5,
             start_secs=0.18,
-            min_volume=0.05,
+            min_volume=0.2,
             confidence=0.7,
             min_speech_duration_ms=120
         )
@@ -751,7 +767,8 @@ async def health():
 
 
 @app.post("/outbound-call")
-async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks):
+async def start_outbound_call(request: OutboundCallRequest, background_tasks: BackgroundTasks, api_key: str = Depends(get_api_key)):
+    
     call_id = str(uuid.uuid4())
     active_call_configs[call_id] = request.dict()
 
