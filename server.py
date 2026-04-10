@@ -371,7 +371,7 @@ def service_factory(config: dict):
         params=VADParams(
             stop_secs=0.5,
             start_secs=0.18,
-            min_volume=0.2,
+            min_volume=0.02,
             confidence=0.7,
             min_speech_duration_ms=120
         )
