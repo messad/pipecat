@@ -364,7 +364,7 @@ def service_factory(config: dict):
         raise ValueError(f"Desteklenmeyen STT provider: {stt_provider}")
 
     system_prompt = config.get("system_prompt", "Sen yardımsever bir asistansın.")
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    context = LLMContext(messages=[{"role": "system", "content": system_prompt},{"role": "user", "content": "Merhaba"}])
 
     vad_analyzer = SileroVADAnalyzer(
         sample_rate=stt_sample_rate,
@@ -741,7 +741,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     logger.info("Pipeline başlatılıyor...")
     try:
-        await asyncio.gather(run_pipeline()) #, warmup_tts()
+        await asyncio.gather(run_pipeline(), warmup_tts()) 
     except Exception as e:
         logger.error(f"Pipeline hatası: {e}")
     finally:
